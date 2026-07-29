@@ -89,7 +89,7 @@ install_system_deps() {
       pkgs="gstreamer1.0-pipewire gstreamer1.0-plugins-good gstreamer1.0-plugins-base"
       [ "$need_build_deps" = "yes" ] && pkgs="$pkgs libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libdbus-1-dev pkg-config build-essential curl rsync"
       echo "Installing via apt: $pkgs"
-      remote_sudo "$target" "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs"
+      remote_sudo "$target" "DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs"
       ;;
     dnf)
       pkgs="pipewire-gstreamer gstreamer1-plugins-good gstreamer1-plugins-base"

@@ -93,6 +93,11 @@ const baseArgs = [];
 if (dev) baseArgs.push("--dev", dev);
 cfg.mcpServers.gdr = entry(baseArgs);
 
+// Always drop stale per-device entries unless --per-device is requested.
+// One MCP process is enough; pick devices with tool arg dev= / host=.
+const stale = Object.keys(cfg.mcpServers).filter((k) => k.startsWith("gdr-"));
+for (const k of stale) delete cfg.mcpServers[k];
+
 if (perDevice && fs.existsSync(cfgPath)) {
   const gdr = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
   for (const id of Object.keys(gdr.hosts || {})) {
@@ -108,6 +113,8 @@ console.log(JSON.stringify(cfg.mcpServers.gdr, null, 2));
 if (perDevice) {
   const keys = Object.keys(cfg.mcpServers).filter((k) => k.startsWith("gdr-"));
   console.log("Per-device servers:", keys.join(", ") || "(none)");
+} else if (stale.length) {
+  console.log("Removed per-device servers:", stale.join(", "));
 }
 ' "$MCP_JSON" "$TARGET" "$USE_WRAPPER" "$DEV" "$PER_DEVICE"
 

@@ -79,6 +79,28 @@ pub fn is_loopback_alias(address: &str) -> bool {
     )
 }
 
+/// Chat/CLI shorthand for "this machine" as a device query (`--host=me`).
+pub fn is_self_device_query(query: &str) -> bool {
+    matches!(
+        query.trim().to_ascii_lowercase().as_str(),
+        "me" | "self" | "this-machine" | "thismachine" | "here"
+    )
+}
+
+/// Prefer profile id `me`, then `local`, then any loopback-addressed host.
+pub fn find_same_machine_device(cfg: &Config) -> Option<String> {
+    if cfg.hosts.contains_key("me") && is_loopback_alias(&cfg.hosts["me"].address) {
+        return Some("me".into());
+    }
+    if cfg.hosts.contains_key("local") && is_loopback_alias(&cfg.hosts["local"].address) {
+        return Some("local".into());
+    }
+    cfg.hosts
+        .iter()
+        .find(|(_, p)| is_loopback_alias(&p.address))
+        .map(|(name, _)| name.clone())
+}
+
 /// Map same-machine aliases to a connectable loopback host.
 /// Profiles may store `local` / `localhost` so config never needs a real IP.
 pub fn normalize_address(address: &str) -> String {
@@ -157,10 +179,14 @@ pub fn save_to(path: &Path, cfg: &Config) -> Result<()> {
 
 /// Resolve a device query to the canonical profile key.
 /// Matches: exact key, case-insensitive key, `label`, or any `alias`.
+/// Also: `me` / `self` / `here` → same-machine profile (`local`, etc.).
 pub fn find_device_name(cfg: &Config, query: &str) -> Option<String> {
     let q = query.trim();
     if q.is_empty() {
         return None;
+    }
+    if is_self_device_query(q) {
+        return find_same_machine_device(cfg);
     }
     if cfg.hosts.contains_key(q) {
         return Some(q.to_string());

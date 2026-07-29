@@ -43,7 +43,6 @@ install_build_deps() {
   pm="$(detect_pkg_manager)"
   case "$pm" in
     apt)
-      run_sudo apt-get update
       run_sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
         build-essential pkg-config curl rsync openssl \
         libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libdbus-1-dev \

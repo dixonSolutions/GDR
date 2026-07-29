@@ -17,23 +17,35 @@ revoked — it cannot escalate.
 
 ## CLI
 
-```bash
-# Full access, never expires
-gdr token create desktop --label "me" --scope all --expires never
+Tokens are stored on the **target** running `gdrd`
+(`~/.local/share/gdr/tokens.json`) — not in your controller `config.json`.
+The controller profile only holds the plaintext you present when connecting.
 
-# Agent: look but carefully click; 30 days
+```bash
+# This machine — omit HOST, or use me / local / --host me (no SSH)
+gdr token list
+gdr token list --host me
+gdr token list me
+gdr token create --label agent --scope all --expires never
+gdr token revoke tok_ab12cd34...                 # defaults to me
+gdr token revoke --host me tok_ab12cd34...
+gdr token revoke tok_ab12cd34... desktop         # remote by positional HOST
+
+# Remote host (uses profile `ssh:` over SSH)
+gdr token create desktop --label "me" --scope all --expires never
 gdr token create desktop --label "cursor-agent" \
   --scope screenshot,mouse,keyboard,type --expires 30d
-
 gdr token list desktop
-# id / label / scopes / expires / last_used / revoked
-# NEVER prints plaintext again after create
-
 gdr token revoke desktop tok_ab12cd34...
 ```
 
 Plaintext is printed **once** at creation (GitHub PAT pattern). Save it into
-`gdr host add ... --token` or the MCP-facing profile immediately.
+the matching device profile:
+
+```bash
+gdr device set-token local --token '<plaintext>'
+# or: gdr device add local --local --token '<plaintext>' --label "home computer"
+```
 
 ## Auth path inside gdrd
 

@@ -184,8 +184,11 @@ enum HostCmd {
 #[derive(Subcommand, Debug, Clone)]
 enum TokenCmd {
     Create {
-        /// Host profile (uses its ssh target).
-        host: String,
+        /// Device id / label / alias. Use `me` for this machine.
+        /// Omit to default to this machine (same as `--host me`).
+        /// (Named `device` so it does not shadow global `--host`.)
+        #[arg(value_name = "HOST")]
+        device: Option<String>,
         #[arg(long)]
         label: String,
         #[arg(long, default_value = "all")]
@@ -193,8 +196,18 @@ enum TokenCmd {
         #[arg(long, default_value = "never")]
         expires: String,
     },
-    List { host: String },
-    Revoke { host: String, id: String },
+    /// List tokens gdrd accepts on a device (hashed store).
+    /// Omit HOST to default to this machine (`me` → local).
+    List {
+        #[arg(value_name = "HOST")]
+        device: Option<String>,
+    },
+    Revoke {
+        /// Token id to revoke (e.g. tok_…).
+        id: String,
+        #[arg(value_name = "HOST")]
+        device: Option<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -407,14 +420,57 @@ fn response_to_result<'a>(
     })
 }
 
-fn ssh_target_for(cfg: &config::Config, host_name: &str) -> Result<String> {
-    let name = config::find_device_name(cfg, host_name)
-        .with_context(|| format!("unknown device '{host_name}'"))?;
+/// Same-machine devices edit local `tokens.json`; remotes use SSH.
+fn admin_target_for(cfg: &config::Config, host_name: &str) -> Result<remote_admin::AdminTarget> {
+    let name = config::find_device_name(cfg, host_name).with_context(|| {
+        format!(
+            "unknown device '{host_name}'. Known: {}. \
+             Tip: --host me  (this machine) or  gdr token list desktop",
+            config::known_device_names(cfg).join(", ")
+        )
+    })?;
     let p = cfg
         .hosts
         .get(&name)
         .with_context(|| format!("unknown host '{name}'"))?;
-    Ok(p.ssh_target())
+    if config::is_loopback_alias(&p.address) {
+        Ok(remote_admin::AdminTarget::Local)
+    } else {
+        Ok(remote_admin::AdminTarget::Ssh(p.ssh_target()))
+    }
+}
+
+/// Positional HOST → global `--host`/`--dev` → this machine (`me`).
+/// Returns (canonical device id, human query used, whether we defaulted).
+fn resolve_token_host(
+    cfg: &config::Config,
+    positional: Option<&str>,
+    global_host: Option<&str>,
+) -> Result<(String, String, bool)> {
+    if let Some(q) = positional.map(str::trim).filter(|s| !s.is_empty()) {
+        let name = config::find_device_name(cfg, q).with_context(|| {
+            format!(
+                "unknown device '{q}'. Known: {}. Use --host me for this machine.",
+                config::known_device_names(cfg).join(", ")
+            )
+        })?;
+        return Ok((name, q.to_string(), false));
+    }
+    if let Some(q) = global_host.map(str::trim).filter(|s| !s.is_empty()) {
+        let name = config::find_device_name(cfg, q).with_context(|| {
+            format!(
+                "unknown device '{q}'. Known: {}. Use --host me for this machine.",
+                config::known_device_names(cfg).join(", ")
+            )
+        })?;
+        return Ok((name, q.to_string(), false));
+    }
+    let name = config::find_same_machine_device(cfg).context(
+        "no same-machine device configured. Add one:\n  \
+         gdr device add me --local --token <TOKEN> --label \"home computer\"\n  \
+         or: gdr token list --host desktop",
+    )?;
+    Ok((name, "me".into(), true))
 }
 
 fn run_host_cmd(cmd: HostCmd, json: bool) -> Result<()> {
@@ -577,17 +633,25 @@ fn run_host_cmd(cmd: HostCmd, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_token_cmd(cmd: TokenCmd, json: bool) -> Result<()> {
+fn run_token_cmd(cmd: TokenCmd, json: bool, global_host: Option<&str>) -> Result<()> {
     let cfg = config::load()?;
     match cmd {
         TokenCmd::Create {
-            host,
+            device,
             label,
             scope,
             expires,
         } => {
-            let ssh = ssh_target_for(&cfg, &host)?;
-            let (id, plaintext) = remote_admin::create_token(&ssh, &label, &scope, &expires)?;
+            let (name, query, defaulted) =
+                resolve_token_host(&cfg, device.as_deref(), global_host)?;
+            if defaulted && !json {
+                eprintln!(
+                    "defaulting to host me (this machine → device '{name}')"
+                );
+            }
+            let target = admin_target_for(&cfg, &name)?;
+            let (id, plaintext) =
+                remote_admin::create_token(&target, &label, &scope, &expires)?;
             if json {
                 println!(
                     "{}",
@@ -603,21 +667,35 @@ fn run_token_cmd(cmd: TokenCmd, json: bool) -> Result<()> {
                     })?
                 );
             } else {
-                println!("created token id={id}");
+                println!("created token id={id} on {name} (query={query})");
                 println!("scopes={scope}  expires={expires}  label={label}");
                 println!();
                 println!("PLAINTEXT (shown once — save to config / MCP now):");
                 println!("{plaintext}");
             }
         }
-        TokenCmd::List { host } => {
-            let ssh = ssh_target_for(&cfg, &host)?;
-            let tokens = remote_admin::list_tokens(&ssh)?;
+        TokenCmd::List { device } => {
+            let (name, query, defaulted) =
+                resolve_token_host(&cfg, device.as_deref(), global_host)?;
+            if defaulted && !json {
+                eprintln!(
+                    "defaulting to host me (this machine → device '{name}')"
+                );
+            }
+            let target = admin_target_for(&cfg, &name)?;
+            let tokens = remote_admin::list_tokens(&target)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&tokens)?);
             } else if tokens.is_empty() {
-                println!("(no tokens on {host})");
+                println!("(no tokens on {name})");
             } else {
+                let where_ = match &target {
+                    remote_admin::AdminTarget::Local => {
+                        "~/.local/share/gdr/tokens.json (this machine)".to_string()
+                    }
+                    remote_admin::AdminTarget::Ssh(s) => format!("via ssh {s}"),
+                };
+                println!("# device={name}  query={query}  {where_}");
                 for t in tokens {
                     let status = if t.revoked { "REVOKED" } else { "active" };
                     println!(
@@ -631,13 +709,20 @@ fn run_token_cmd(cmd: TokenCmd, json: bool) -> Result<()> {
                 }
             }
         }
-        TokenCmd::Revoke { host, id } => {
-            let ssh = ssh_target_for(&cfg, &host)?;
-            remote_admin::revoke_token(&ssh, &id)?;
+        TokenCmd::Revoke { device, id } => {
+            let (name, _query, defaulted) =
+                resolve_token_host(&cfg, device.as_deref(), global_host)?;
+            if defaulted && !json {
+                eprintln!(
+                    "defaulting to host me (this machine → device '{name}')"
+                );
+            }
+            let target = admin_target_for(&cfg, &name)?;
+            remote_admin::revoke_token(&target, &id)?;
             if json {
-                println!("{}", serde_json::json!({"ok": true, "revoked": id}));
+                println!("{}", serde_json::json!({"ok": true, "revoked": id, "device": name}));
             } else {
-                println!("revoked {id} on {host} (existing connections keep working until disconnect)");
+                println!("revoked {id} on {name} (existing connections keep working until disconnect)");
             }
         }
     }
@@ -655,7 +740,9 @@ async fn main() -> Result<()> {
         Command::Service { cmd } => return manage::run_service(cmd.clone()),
         Command::Mcp { cmd } => return manage::run_mcp(cmd.clone()),
         Command::Pkg { cmd } => return manage::run_pkg(cmd.clone()),
-        Command::Token { cmd } => return run_token_cmd(cmd.clone(), json),
+        Command::Token { cmd } => {
+            return run_token_cmd(cmd.clone(), json, cli.host.as_deref())
+        }
         Command::Audit {
             host,
             lines,
@@ -668,8 +755,9 @@ async fn main() -> Result<()> {
                 .or_else(|| cli.host.clone())
                 .or_else(|| cfg.default_host.clone())
                 .context("pass a host name or set default_host")?;
-            let ssh = ssh_target_for(&cfg, &name)?;
-            let out = remote_admin::audit_tail(&ssh, *lines, since.as_deref(), token_id.as_deref())?;
+            let target = admin_target_for(&cfg, &name)?;
+            let out =
+                remote_admin::audit_tail(&target, *lines, since.as_deref(), token_id.as_deref())?;
             println!("{out}");
             return Ok(());
         }
