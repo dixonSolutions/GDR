@@ -1,0 +1,38 @@
+[package]
+name = "gdrd"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+common = { package = "gdr-common", path = "../common" }
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+zbus = { version = "4", default-features = false, features = ["tokio"] }
+gstreamer = "0.22"
+gstreamer-app = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+rand = "0.8"
+futures-util = "0.3"
+rcgen = "0.13"
+rustls = "0.23"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+hex = "0.4"
+dirs = "5"
+
+# System requirements on the target machine (install via apt):
+#   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+#   gstreamer1.0-plugins-good gstreamer1.0-pipewire
+#   libdbus-1-dev pkg-config
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

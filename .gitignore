@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/target/
+
+# Node
+mcp-server/node_modules/
+mcp-server/dist/
+npm-debug.log*
+
+# Local secrets / runtime
+.config/
+*.pem
+*.key
+screenshot.png
+*.png
+!docs/**/*.png
+/tmp/
+.env
+.env.*
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+*~
+
+# Test artifacts
+*.tmp
+/tmp/

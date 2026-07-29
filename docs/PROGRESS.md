@@ -1,0 +1,67 @@
+# Progress log
+
+Living checklist. Update this when a milestone lands or a decision flips.
+
+## 2026-07-29 — complete implementation + live deploy
+
+### Done
+
+- [x] Workspace: `common` / `server` (`gdrd`) / `client` (`gdr`) / `mcp-server`
+- [x] JSON length-prefixed TLS protocol + TypeScript mirror
+- [x] Mutter RemoteDesktop + ScreenCast + PipeWire capture (GStreamer)
+- [x] Interactive `deploy.sh` (apt/dnf, prebuilt vs source-on-target, MCP merge)
+- [x] Shared `~/.config/gdr/config.json` — resolve order, `gdr host *`
+- [x] Multi-token store (`tokens.json`, hashed, scopes, expiry, revoke)
+- [x] Legacy `GDR_TOKEN` full-scope fallback + `gdrd --seed-token`
+- [x] Audit log (JSON lines, 5 MiB self-rotate)
+- [x] Scope enforcement on every post-auth request
+- [x] CLI: `token create|list|revoke`, `audit`, `get-password`
+- [x] MCP: multi-host, `gdr_get_password`, `gdr_list_hosts`, gnome_* aliases
+- [x] Non-interactive deploy via `GDR_SUDO_PASSWORD` + `GDR_YES`
+- [x] Unit tests: common 12, client 7, server 8 — all green
+- [x] docs/ tree (architecture, protocol, tokens, MCP, deploy, security, headless)
+- [x] **Live deploy** to `borys@100.118.238.2` (source build on target)
+- [x] **E2E verified** (controller → target over Tailscale):
+  - `ping` → pong
+  - `move` / `click` / `type` → ok
+  - `screenshot` → PNG returned (1×1 — host has no physical display; see HEADLESS.md)
+  - `get-password sudo` → plaintext; `user` → clear “not set”
+  - scoped token `screenshot` → ping ok, move **denied**
+  - `token list` + `audit` over SSH admin plane
+
+### Bugs fixed during E2E
+
+1. zbus ProxyBuilder missing `.destination(...)` → fake “destination” parameter error  
+2. RD/SC start order (RD first; don’t Start ScreenCast session when linked)  
+3. Headless fallback: `RecordVirtual { is-platform, 1920×1080 }`  
+4. PipeWire signal subscribe-before-start race  
+
+### Decisions locked
+
+| Question | Choice |
+|---|---|
+| Live revocation | No new connections after revoke; existing sessions drain |
+| Deploy token default | `all` + never-expire (`initial-install`) |
+| Audit rotation | gdrd self-rotates at 5 MiB (+ `.1` backup) |
+| Password tool | `gdr_get_password` as specified; safer alt documented |
+| Token admin channel | SSH only |
+
+### Still open / next
+
+- [ ] Plug in a monitor (or persistent virtual display) and re-verify full-res screenshots
+- [ ] Optional: `gdr_run_privileged` MCP tool
+- [ ] Optional: immediate live-session kill on revoke
+- [ ] Optional: xkbcommon typing; normalized 0..1 coordinates
+- [ ] Optional: public git remote + clone-based install (today: rsync)
+- [ ] Mutter consent dialog behavior on this GNOME 50 host when a panel is attached
+
+### Reference deployment
+
+| Role | Machine |
+|---|---|
+| Target | `borys@100.118.238.2` — Debian, GNOME 50.2 Wayland, linger on |
+| Controller | local `eva` — `gdr` CLI + config profile `desktop` |
+
+Secrets (token, sudo password, cert pin) live only in
+`~/.config/gdr/config.json` on the controller and the target’s unit /
+`tokens.json` — **never in git**.
