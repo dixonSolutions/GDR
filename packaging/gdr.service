@@ -1,0 +1,21 @@
+[Unit]
+Description=gdr control server (GNOME desktop remote)
+Documentation=file:///usr/share/doc/gdr/README.md
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/gdrd --bind 0.0.0.0:7337
+Environment=RUST_LOG=info
+# ScreenCast starts on first screenshot/input; physical monitors idle-stop
+# after GDR_DISPLAY_IDLE_SECS (default 45). Headless/virtual Meta-* stays up.
+# Environment=GDR_DISPLAY_IDLE_SECS=45
+# Environment=GDR_EAGER_DISPLAY=1
+# Optional legacy full-scope token; prefer hashed store via `gdrd --seed-token`.
+# Environment=GDR_TOKEN=
+Restart=on-failure
+RestartSec=2
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+
+[Install]
+WantedBy=default.target

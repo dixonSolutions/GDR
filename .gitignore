@@ -7,6 +7,9 @@ mcp-server/node_modules/
 mcp-server/dist/
 npm-debug.log*
 
+# Built system packages (.deb / .rpm)
+/dist/
+
 # Local secrets / runtime
 .config/
 *.pem
@@ -14,6 +17,8 @@ npm-debug.log*
 screenshot.png
 *.png
 !docs/**/*.png
+docs/fixtures*.png
+docs/fixtures-*/
 /tmp/
 .env
 .env.*

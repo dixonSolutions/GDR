@@ -1,0 +1,55 @@
+---
+description: Honor @gdr -dev="…" — control that device, verify token, see the screen
+alwaysApply: true
+---
+
+# GDR device mention (`@gdr -dev=`)
+
+When the user writes something like:
+
+```text
+@gdr -dev="home computer"
+@gdr -dev=desktop
+@gdr-local
+```
+
+treat that as the **active GDR device** for the rest of the turn (and until they switch).
+
+## Required behavior
+
+1. **Parse** the device from chat. Cursor does not inject MCP argv from `-dev=`;
+   you must pass `dev: "<value>"` (or `host:`) on every `user-gdr` / `gdr_*` tool call.
+2. **Validate** with `gdr_status` (`dev` set) — confirms the profile exists and the
+   stored token authenticates against gdrd (`auth: "valid"`).
+3. **See the desktop** with `gdr_screenshot` on that same `dev` when the user is
+   asking you to look at, drive, or reason about what is on screen — including when
+   they are mid-task and expect you to keep visual context.
+4. **Stay on that device** for all subsequent `gdr_*` calls until they name another.
+
+## Manage devices
+
+- List: `gdr_list_devices`
+- Add / update: `gdr_device_add` (id, address or `local`, token, optional label/aliases/pin/ssh/sudo)
+- Remove: `gdr_device_remove`
+- Default: `gdr_device_default`
+- CLI equivalent: `gdr device add|list|remove|…`
+
+Never echo tokens or sudo passwords back into chat. Tool results for device add
+already omit secrets.
+
+## Examples
+
+User: `@gdr -dev="home computer" what's on screen?`
+
+```text
+gdr_status({ "dev": "home computer" })
+gdr_screenshot({ "dev": "home computer" })
+```
+
+User: `@gdr -dev=desktop open a terminal`
+
+```text
+gdr_status({ "dev": "desktop" })
+gdr_screenshot({ "dev": "desktop" })   # orient
+gdr_hotkey({ "dev": "desktop", "hotkey": "Ctrl+Alt+t" })
+```

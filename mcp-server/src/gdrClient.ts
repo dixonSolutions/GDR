@@ -17,6 +17,7 @@ export type Request =
   | { type: "MouseScroll"; dx: number; dy: number }
   | { type: "KeyEvent"; keycode: number; pressed: boolean }
   | { type: "TypeText"; text: string }
+  | { type: "GetCursor" }
   | { type: "Ping" };
 
 export type Response =
@@ -25,6 +26,7 @@ export type Response =
   | { type: "AuthOkScoped"; scopes: string[] }
   | { type: "AuthFailed" }
   | { type: "Screenshot"; png_base64: string }
+  | { type: "CursorPosition"; x: number; y: number; known: boolean }
   | { type: "Pong" }
   | { type: "Error"; message: string };
 
@@ -42,12 +44,33 @@ export interface GdrConfig {
 
 /** A persistent, auto-reconnecting connection to a gdrd.
  * Calls are serialized (one in-flight request at a time) since the wire
- * protocol is strictly request/response per connection. */
+ * protocol is strictly request/response per connection.
+ *
+ * Idle disconnect: after `GDR_MCP_IDLE_MS` (default 15000) with no
+ * requests, the TLS socket is closed so gdrd can idle-stop ScreenCast.
+ * Cursor keeps the MCP *process* up; only the data-plane link drops. */
 export class GdrClient {
   private socket: tls.TLSSocket | null = null;
   private queue: Promise<unknown> = Promise.resolve();
+  private idleTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly idleMs: number;
 
-  constructor(private cfg: GdrConfig) {}
+  constructor(private cfg: GdrConfig) {
+    const raw = process.env.GDR_MCP_IDLE_MS;
+    const parsed = raw !== undefined ? Number(raw) : 15_000;
+    this.idleMs = Number.isFinite(parsed) && parsed >= 0 ? parsed : 15_000;
+  }
+
+  private bumpIdle(): void {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    if (this.idleMs === 0) return;
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null;
+      this.close();
+    }, this.idleMs);
+    // Don't keep Node alive solely for the idle timer.
+    this.idleTimer.unref?.();
+  }
 
   private async ensureConnected(): Promise<tls.TLSSocket> {
     if (this.socket && !this.socket.destroyed) return this.socket;
@@ -139,7 +162,9 @@ export class GdrClient {
     const run = async () => {
       const socket = await this.ensureConnected();
       try {
-        return await this.sendRaw(socket, req);
+        const resp = await this.sendRaw(socket, req);
+        this.bumpIdle();
+        return resp;
       } catch (e) {
         this.socket = null;
         throw e;
@@ -156,7 +181,32 @@ export class GdrClient {
     return this.request({ type: "MouseButton", button, pressed: false });
   }
 
+  /** Double-click (or N-click) at absolute coordinates. */
+  async multiClick(
+    x: number,
+    y: number,
+    button: number = BTN_LEFT,
+    clicks = 2,
+    gapMs = 60
+  ): Promise<Response> {
+    let last: Response = { type: "Ok" };
+    await this.request({ type: "MouseMove", x, y });
+    const n = Math.max(1, Math.min(10, Math.floor(clicks)));
+    for (let i = 0; i < n; i++) {
+      await this.request({ type: "MouseButton", button, pressed: true });
+      last = await this.request({ type: "MouseButton", button, pressed: false });
+      if (i + 1 < n) {
+        await new Promise((r) => setTimeout(r, gapMs));
+      }
+    }
+    return last;
+  }
+
   close() {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
     this.socket?.destroy();
     this.socket = null;
   }

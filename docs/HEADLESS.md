@@ -8,7 +8,11 @@ actually uses, negotiate a real resolution over PipeWire, and capture that.
 
 ## How it works (implemented)
 
-On startup, `DisplayProvider`:
+By default gdrd starts **lazy** (no ScreenCast until the first
+screenshot/input). On headless hosts use `--eager-display` (or
+`GDR_EAGER_DISPLAY=1`) so Meta-* exists at boot.
+
+When the display session starts, `DisplayProvider`:
 
 1. Opens Mutter RemoteDesktop + ScreenCast (linked session).
 2. If no connector is usable → `RecordVirtual { is-platform: true, width, height, cursor-mode }`.
@@ -19,6 +23,10 @@ On startup, `DisplayProvider`:
 5. Screenshots pull frames from the **same appsink** (a second
    `pipewiresrc` on the same node will stall).
 
+Platform virtual monitors are **not** idle-stopped (removing them would
+kill the session's only display). Physical monitors idle-stop after
+`GDR_DISPLAY_IDLE_SECS` (default 45).
+
 Logs you want to see:
 
 ```
@@ -28,7 +36,7 @@ display provider ready (virtual=true, node=…, 1920x1080)
 ```
 
 `DisplayConfig` should then show `Meta-0` with one logical monitor while
-gdrd is running.
+the display session is active.
 
 ## Verified (2026-07-29, `borys@100.118.238.2`)
 
@@ -42,6 +50,8 @@ gdrd is running.
 ```bash
 gdrd --width 1920 --height 1080   # default
 gdrd --connector eDP-1            # force a physical connector when present
+gdrd --eager-display              # open Mutter at boot (recommended headless)
+gdrd --display-idle-secs 0        # never idle-stop once started
 gdrd --no-display                 # control plane only (no Mutter session)
 ```
 

@@ -2,7 +2,7 @@
 
 ## Controller: `~/.config/gdr/config.json`
 
-Single source of remembered connections for **both** `gdr` and `gdr-mcp`.
+Single source of remembered **devices** for **both** `gdr` and `gdr-mcp`.
 Always written `chmod 600`.
 
 ```json
@@ -15,8 +15,18 @@ Always written `chmod 600`.
       "token": "<plaintext bearer>",
       "pin": "<sha256 hex of server cert, no colons>",
       "ssh": "borys@100.118.238.2",
+      "label": "office tower",
+      "aliases": ["office"],
       "sudo_password": null,
       "user_password": null
+    },
+    "local": {
+      "address": "localhost",
+      "port": 7337,
+      "token": "<…>",
+      "pin": "<…>",
+      "label": "home computer",
+      "aliases": ["home"]
     }
   }
 }
@@ -24,98 +34,113 @@ Always written `chmod 600`.
 
 | Field | Required | Notes |
 |---|---|---|
-| `address` | yes | Host/IP for the TLS data plane |
+| `address` | yes | Host/IP for the TLS data plane. Same-machine: `local` / `localhost` / `.` |
 | `port` | no (7337) | gdrd listen port |
-| `token` | yes | Plaintext bearer used at Auth |
-| `pin` | recommended | Cert fingerprint; omit = TOFU warning |
+| `token` | yes | Plaintext bearer used at Auth (per device) |
+| `pin` | recommended | Cert fingerprint |
 | `ssh` | recommended | `user@host` for admin-plane CLI ops |
-| `sudo_password` | opt-in | Plaintext; used by deploy non-interactive + `gdr_get_password` |
+| `label` | opt | Friendly name; matched by `--host` / MCP `dev=` |
+| `aliases` | opt | Extra names that resolve to this device |
+| `sudo_password` | opt-in | Plaintext; deploy + `gdr_get_password` |
 | `user_password` | opt-in | Plaintext; same exposure model |
 
-### CLI management
+Lookups accept **id**, **label**, or **alias** (case-insensitive), e.g. `home computer`.
+
+### Device management CLI
 
 ```bash
-gdr host add desktop \
-  --address 100.118.238.2 --token "$TOKEN" --pin "$PIN" \
-  --ssh borys@100.118.238.2 \
-  --ask-sudo          # prompts, not echoed
-gdr host list
-gdr host show desktop
-gdr host default desktop
-gdr host remove desktop
+gdr device add home --address 100.x.x.x --token "$TOKEN" --pin "$PIN" \
+  --label "home computer" --alias home --ask-sudo --default
 
-gdr get-password sudo --host desktop
-gdr get-password user --host desktop   # → clear "not set" if missing
+gdr device list
+gdr device show "home computer"
+gdr device set-label local "home computer"
+gdr device add-alias local home
+gdr device set-sudo home --ask
+gdr device set-token home --ask
+gdr device default home
+gdr device remove office
+
+# Still supported:
+gdr host add … / list / show / remove / default
 ```
 
-`deploy.sh` can write this profile automatically after install
-(`GDR_PROFILE_NAME`, `GDR_SAVE_SUDO=1`, `GDR_SUDO_PASSWORD=...`).
-
-### Resolution order
-
-See ARCHITECTURE.md. Env vars still work for one-off use:
+### System package management
 
 ```bash
-export GDR_ADDR=100.118.238.2:7337
-export GDR_TOKEN=...
-export GDR_PIN=...
-gdr ping
+gdr service status|start|stop|restart|enable|disable|logs
+gdr mcp setup-cursor [--dev "home computer"] [--per-device] [--restart]
+gdr mcp status
+gdr mcp update --restart-cursor
+gdr pkg info|version|paths|update
 ```
 
-## Target: `~/.local/share/gdr/`
+## Cursor MCP + device selection
 
-| Path | Purpose |
-|---|---|
-| `cert.pem` / `key.pem` | Self-signed TLS material (key is 600) |
-| `tokens.json` | Hashed multi-token store (600) |
-| `audit.log` | JSON-lines audit trail (self-rotates) |
+Devices/tokens/sudo stay in `config.json`. Cursor only needs how to start `gdr-mcp`:
 
-### `tokens.json` shape
+```bash
+# Default all tools to one device:
+gdr mcp setup-cursor --dev "home computer" --restart
+
+# Or one MCP server entry per device (mention @gdr-local / @gdr-desktop):
+gdr mcp setup-cursor --per-device --restart
+```
+
+`~/.cursor/mcp.json` example:
 
 ```json
 {
-  "tokens": [
-    {
-      "id": "tok_ab12...",
-      "token_hash": "<sha256 hex of plaintext>",
-      "label": "initial-install",
-      "created_at": "2026-07-29T07:00:00+00:00",
-      "expires_at": null,
-      "scopes": ["all"],
-      "last_used_at": null,
-      "revoked": false
+  "mcpServers": {
+    "gdr": {
+      "command": "node",
+      "args": [
+        "/path/to/gdr/mcp-server/dist/index.js",
+        "--dev",
+        "home computer"
+      ]
+    },
+    "gdr-local": {
+      "command": "node",
+      "args": ["…/dist/index.js", "--dev", "local"]
     }
-  ]
+  }
 }
 ```
 
-Managed via `gdr token create|list|revoke` (SSH) or `gdrd --seed-token`.
+### What actually works for `@gdr -dev="home computer"`
 
-## systemd unit
+Cursor does **not** parse `-dev=` into MCP argv by itself. These do work:
 
-`~/.config/systemd/user/gdr.service` — written by `deploy.sh`.
+1. **Tool argument** — agent passes `dev: "home computer"` (or `host:`) on any `gdr_*` tool.  
+   Project rule `.cursor/rules/gdr-device.mdc` tells the agent to treat that chat
+   shorthand as the active device, run `gdr_status`, and screenshot when visual.
+2. **Server default** — `gdr-mcp --dev "home computer"` in mcp.json `args` (no tool arg needed).
+3. **Per-device MCP server** — `@gdr-local` / `@gdr-home` after `--per-device` setup.
 
+```text
+gdr_status({ "dev": "home computer" })   # token valid?
+gdr_screenshot({ "dev": "home computer" })
+gdr_list_devices
+gdr_device_add({ "id": "local", "local": true, "token": "…", "label": "home computer" })
 ```
-ExecStart=%h/.local/bin/gdrd --bind 0.0.0.0:7337
-Environment=GDR_TOKEN=...
-Environment=XDG_RUNTIME_DIR=/run/user/%U
-```
 
-`GDR_TOKEN` remains as a legacy full-scope fallback even when `tokens.json`
-exists. Prefer issuing scoped tokens for agents and keeping the install
-token for yourself.
+## Resolution order
 
-## Environment variables
+1. Explicit `--addr` + `--token` (CLI)  
+2. Tool `dev=` / `host=` / CLI `--host` / `--dev` (id|label|alias)  
+3. MCP process `--dev` / env `GDR_DEV`  
+4. Legacy env `GDR_HOST`+`GDR_TOKEN`  
+5. `default_host`  
+6. Sole configured device  
 
-| Var | Where | Meaning |
-|---|---|---|
-| `GDR_TOKEN` | target unit / controller | Bearer (legacy or override) |
-| `GDR_TOKENS_PATH` | gdrd | Override tokens.json path |
-| `GDR_AUDIT_PATH` | gdrd | Override audit.log path |
-| `GDR_ADDR` / `GDR_HOST`+`GDR_PORT` | controller | Connection target |
-| `GDR_PIN` | controller | Cert fingerprint |
-| `GDR_SUDO_PASSWORD` | deploy.sh | Non-interactive remote sudo |
-| `GDR_YES=1` | deploy.sh | Skip confirms (agent/CI) |
-| `GDR_INSTALL_METHOD=2` | deploy.sh | Force source build on target |
-| `GDR_PROFILE_NAME` | deploy.sh | Name for saved config profile |
-| `GDR_SAVE_SUDO=1` | deploy.sh | Persist sudo password into profile |
+## Target: `~/.local/share/gdr/` (or package paths)
+
+| Path | Purpose |
+|---|---|
+| `cert.pem` / `key.pem` | Self-signed TLS |
+| `tokens.json` | Hashed multi-token store |
+| `audit.log` | JSON-lines audit |
+
+System package also installs `/usr/bin/gdr`, `/usr/bin/gdrd`, `/usr/bin/gdr-mcp`,
+`/usr/lib/systemd/user/gdr.service`, `/usr/share/gdr/mcp-server/`.

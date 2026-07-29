@@ -20,6 +20,11 @@
 3. **MCP cannot invent IPs** — only saved profiles (or fixed env).  
 4. **Cert pinning** — MitM on the LAN/Tailscale path fails closed once pinned.  
 5. **chmod 600** on config.json, tokens.json, key.pem, audit.log.  
+6. **No 24/7 screen broadcast** — gdrd opens Mutter ScreenCast on demand;
+   physical monitors idle-stop after `GDR_DISPLAY_IDLE_SECS` (default 45).
+   MCP keeps its process up for Cursor health, but drops the TLS link to
+   gdrd after `GDR_MCP_IDLE_MS` (default 15s). Headless virtual Meta-*
+   stays up once started (see HEADLESS.md).  
 
 ## Explicit tradeoffs you opted into
 

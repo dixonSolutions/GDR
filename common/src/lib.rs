@@ -51,6 +51,11 @@ pub enum Request {
     /// the server's loaded keymap (press+release per character).
     TypeText { text: String },
 
+    /// Return the last absolute pointer position injected via `MouseMove`
+    /// (Mutter RemoteDesktop does not expose a live query). Unknown until
+    /// the first move/click from a controller.
+    GetCursor,
+
     Ping,
 }
 
@@ -63,7 +68,8 @@ impl Request {
             Request::Screenshot { .. } => Some(Scope::Screenshot),
             Request::MouseMove { .. }
             | Request::MouseButton { .. }
-            | Request::MouseScroll { .. } => Some(Scope::Mouse),
+            | Request::MouseScroll { .. }
+            | Request::GetCursor => Some(Scope::Mouse),
             Request::KeyEvent { .. } => Some(Scope::Keyboard),
             Request::TypeText { .. } => Some(Scope::Type),
         }
@@ -81,6 +87,8 @@ pub enum Response {
     AuthOkScoped { scopes: Vec<String> },
     AuthFailed,
     Screenshot { png_base64: String },
+    /// Last known absolute pointer position (see `Request::GetCursor`).
+    CursorPosition { x: f64, y: f64, known: bool },
     Pong,
     Error { message: String },
 }

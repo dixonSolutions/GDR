@@ -40,6 +40,13 @@ pub struct HostProfile {
     pub sudo_password: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_password: Option<String>,
+    /// Human-friendly display name (e.g. "home computer"). Also matched by
+    /// `--host` / MCP `dev=` lookups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Extra names that resolve to this device (case-insensitive).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
 }
 
 fn default_port() -> u16 {
@@ -48,14 +55,46 @@ fn default_port() -> u16 {
 
 impl HostProfile {
     pub fn addr_port(&self) -> String {
-        format!("{}:{}", self.address, self.port)
+        format!("{}:{}", normalize_address(&self.address), self.port)
     }
 
     pub fn ssh_target(&self) -> String {
-        self.ssh
-            .clone()
-            .unwrap_or_else(|| self.address.clone())
+        self.ssh.clone().unwrap_or_else(|| {
+            let addr = normalize_address(&self.address);
+            if is_loopback_alias(&addr) || is_loopback_alias(&self.address) {
+                // Same-machine profiles: admin plane is local user, not an IP.
+                whoami_user().unwrap_or_else(|| "localhost".into())
+            } else {
+                self.address.clone()
+            }
+        })
     }
+}
+
+/// True for addresses that mean "this machine" (no LAN/Tailscale IP required).
+pub fn is_loopback_alias(address: &str) -> bool {
+    matches!(
+        address.trim().to_ascii_lowercase().as_str(),
+        "" | "local" | "localhost" | "loopback" | "this" | "." | "127.0.0.1" | "::1"
+    )
+}
+
+/// Map same-machine aliases to a connectable loopback host.
+/// Profiles may store `local` / `localhost` so config never needs a real IP.
+pub fn normalize_address(address: &str) -> String {
+    let trimmed = address.trim();
+    if is_loopback_alias(trimmed) {
+        "127.0.0.1".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn whoami_user() -> Option<String> {
+    std::env::var("USER")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("LOGNAME").ok().filter(|s| !s.is_empty()))
 }
 
 /// Resolved connection parameters after applying flags → profile → default.
@@ -74,7 +113,7 @@ pub struct ResolvedHost {
 
 impl ResolvedHost {
     pub fn addr_port(&self) -> String {
-        format!("{}:{}", self.address, self.port)
+        format!("{}:{}", normalize_address(&self.address), self.port)
     }
 }
 
@@ -116,9 +155,55 @@ pub fn save_to(path: &Path, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a device query to the canonical profile key.
+/// Matches: exact key, case-insensitive key, `label`, or any `alias`.
+pub fn find_device_name(cfg: &Config, query: &str) -> Option<String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return None;
+    }
+    if cfg.hosts.contains_key(q) {
+        return Some(q.to_string());
+    }
+    let ql = q.to_ascii_lowercase();
+    for (name, p) in &cfg.hosts {
+        if name.to_ascii_lowercase() == ql {
+            return Some(name.clone());
+        }
+        if p.label
+            .as_deref()
+            .is_some_and(|l| l.trim().eq_ignore_ascii_case(q))
+        {
+            return Some(name.clone());
+        }
+        if p.aliases
+            .iter()
+            .any(|a| a.trim().eq_ignore_ascii_case(q))
+        {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
+pub fn known_device_names(cfg: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, p) in &cfg.hosts {
+        out.push(name.clone());
+        if let Some(l) = &p.label {
+            out.push(format!("{name} (label: {l})"));
+        }
+        for a in &p.aliases {
+            out.push(format!("{name} (alias: {a})"));
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Resolution order:
 /// 1. Explicit addr + token flags (pin optional)
-/// 2. Named `--host <profile>`
+/// 2. Named `--host` / device query (id, label, or alias)
 /// 3. `default_host`
 /// 4. If exactly one profile exists, that one
 pub fn resolve(
@@ -132,20 +217,23 @@ pub fn resolve(
     // a host name is also given — but typically flags are complete).
     if let (Some(addr), Some(token)) = (addr_flag, token_flag) {
         let (address, port) = split_addr(addr)?;
+        let address = normalize_address(&address);
         let mut pin = pin_flag.map(|s| s.to_string());
         let mut ssh = None;
         let mut sudo_password = None;
         let mut user_password = None;
         let mut name = None;
         if let Some(h) = host_flag {
-            if let Some(p) = cfg.hosts.get(h) {
-                name = Some(h.to_string());
-                if pin.is_none() {
-                    pin = p.pin.clone();
+            if let Some(canon) = find_device_name(cfg, h) {
+                if let Some(p) = cfg.hosts.get(&canon) {
+                    name = Some(canon);
+                    if pin.is_none() {
+                        pin = p.pin.clone();
+                    }
+                    ssh = p.ssh.clone();
+                    sudo_password = p.sudo_password.clone();
+                    user_password = p.user_password.clone();
                 }
-                ssh = p.ssh.clone();
-                sudo_password = p.sudo_password.clone();
-                user_password = p.user_password.clone();
             }
         }
         return Ok(ResolvedHost {
@@ -161,19 +249,27 @@ pub fn resolve(
     }
 
     let name = if let Some(h) = host_flag {
-        h.to_string()
+        find_device_name(cfg, h).with_context(|| {
+            format!(
+                "unknown device '{h}'. Known: {}",
+                known_device_names(cfg).join(", ")
+            )
+        })?
     } else if let Some(d) = &cfg.default_host {
-        d.clone()
+        find_device_name(cfg, d)
+            .or_else(|| Some(d.clone()))
+            .filter(|n| cfg.hosts.contains_key(n))
+            .with_context(|| format!("default_host '{d}' not found in hosts"))?
     } else if cfg.hosts.len() == 1 {
         cfg.hosts.keys().next().unwrap().clone()
     } else if cfg.hosts.is_empty() {
         bail!(
-            "no connection configured. Pass --addr/--token, or add a host:\n  \
-             gdr host add <name> --address IP --token TOKEN [--pin FP]"
+            "no connection configured. Pass --addr/--token, or add a device:\n  \
+             gdr device add <id> --address IP --token TOKEN [--label \"home computer\"]"
         );
     } else {
         bail!(
-            "multiple hosts configured ({}); pass --host <name> or set default_host",
+            "multiple devices configured ({}); pass --host/--dev <id|label> or set default",
             cfg.hosts.keys().cloned().collect::<Vec<_>>().join(", ")
         );
     };
@@ -188,6 +284,7 @@ pub fn resolve(
     } else {
         (profile.address.clone(), profile.port)
     };
+    let address = normalize_address(&address);
     let token = token_flag
         .map(|s| s.to_string())
         .unwrap_or_else(|| profile.token.clone());
@@ -208,17 +305,25 @@ pub fn resolve(
 }
 
 pub fn split_addr(addr: &str) -> Result<(String, u16)> {
-    if let Some((host, port)) = addr.rsplit_once(':') {
+    // Same-machine aliases (optionally with :port)
+    let trimmed = addr.trim();
+    if let Some((host, port)) = trimmed.rsplit_once(':') {
+        if is_loopback_alias(host) && port.parse::<u16>().is_ok() {
+            return Ok(("127.0.0.1".into(), port.parse()?));
+        }
         if !host.is_empty() && port.parse::<u16>().is_ok() && !host.contains("://") {
             // Avoid treating IPv6 without brackets wrongly: if host has
             // multiple ':', require brackets. Simple path for IPv4/hostname.
             if host.matches(':').count() == 0 {
-                return Ok((host.to_string(), port.parse()?));
+                return Ok((normalize_address(host), port.parse()?));
             }
         }
     }
+    if is_loopback_alias(trimmed) {
+        return Ok(("127.0.0.1".into(), default_port()));
+    }
     // Bare host → default port
-    Ok((addr.to_string(), default_port()))
+    Ok((trimmed.to_string(), default_port()))
 }
 
 pub fn upsert_host(cfg: &mut Config, name: &str, profile: HostProfile) {
@@ -248,9 +353,12 @@ pub fn get_password<'a>(host: &'a HostProfile, kind: &str) -> Result<&'a str> {
 /// Message form used by MCP / --json: never panics, always a clear string.
 pub fn password_message(cfg: &Config, host: Option<&str>, kind: &str) -> String {
     let name = match host {
-        Some(h) => h.to_string(),
+        Some(h) => match find_device_name(cfg, h) {
+            Some(n) => n,
+            None => return format!("Unknown device '{h}'."),
+        },
         None => match &cfg.default_host {
-            Some(d) => d.clone(),
+            Some(d) => find_device_name(cfg, d).unwrap_or_else(|| d.clone()),
             None if cfg.hosts.len() == 1 => cfg.hosts.keys().next().unwrap().clone(),
             _ => return "No host specified and no default_host is set.".into(),
         },
@@ -289,6 +397,8 @@ mod tests {
                 ssh: Some("borys@192.168.1.50".into()),
                 sudo_password: Some("s3cret".into()),
                 user_password: None,
+                label: Some("home computer".into()),
+                aliases: vec!["home".into()],
             },
         );
         cfg
@@ -348,5 +458,39 @@ mod tests {
     fn split_addr_variants() {
         assert_eq!(split_addr("1.2.3.4:9").unwrap(), ("1.2.3.4".into(), 9));
         assert_eq!(split_addr("host").unwrap(), ("host".into(), 7337));
+        assert_eq!(split_addr("local").unwrap(), ("127.0.0.1".into(), 7337));
+        assert_eq!(split_addr("localhost:9000").unwrap(), ("127.0.0.1".into(), 9000));
+    }
+
+    #[test]
+    fn resolve_local_profile_no_ip() {
+        let mut cfg = Config::default();
+        upsert_host(
+            &mut cfg,
+            "local",
+            HostProfile {
+                address: "local".into(),
+                port: 7337,
+                token: "tok".into(),
+                pin: None,
+                ssh: None,
+                sudo_password: None,
+                user_password: None,
+                label: None,
+                aliases: vec![],
+            },
+        );
+        let r = resolve(&cfg, Some("local"), None, None, None).unwrap();
+        assert_eq!(r.address, "127.0.0.1");
+        assert_eq!(r.addr_port(), "127.0.0.1:7337");
+    }
+
+    #[test]
+    fn resolve_by_label_and_alias() {
+        let cfg = sample();
+        let by_label = resolve(&cfg, Some("home computer"), None, None, None).unwrap();
+        assert_eq!(by_label.name.as_deref(), Some("laptop"));
+        let by_alias = resolve(&cfg, Some("HOME"), None, None, None).unwrap();
+        assert_eq!(by_alias.name.as_deref(), Some("laptop"));
     }
 }

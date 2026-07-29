@@ -133,6 +133,7 @@ impl Drop for KeepaliveConsumer {
 
 unsafe impl Send for KeepaliveConsumer {}
 
+#[derive(Clone, Copy, Debug)]
 pub struct CaptureSize {
     pub width: i32,
     pub height: i32,
@@ -151,6 +152,11 @@ static KEEPALIVE: Mutex<Option<KeepaliveConsumer>> = Mutex::new(None);
 
 pub fn install_keepalive(consumer: KeepaliveConsumer) {
     *KEEPALIVE.lock().unwrap() = Some(consumer);
+}
+
+/// Drop the long-lived PipeWire consumer (stops GStreamer pipeline).
+pub fn clear_keepalive() {
+    *KEEPALIVE.lock().unwrap() = None;
 }
 
 pub fn keepalive_node() -> Option<u32> {

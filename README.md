@@ -29,17 +29,19 @@ cargo build --release -p gdr
 
 Interactive menu (no env vars): `./deploy.sh user@host`
 
-## Remembered connections
+## Remembered devices
 
-After deploy (or `gdr host add`), both CLI and MCP read
-`~/.config/gdr/config.json` (chmod 600). Then:
+After deploy (or `gdr device add`), both CLI and MCP read
+`~/.config/gdr/config.json` (chmod 600) — per-device token, pin, optional sudo.
 
 ```bash
-gdr screenshot          # uses default_host
-gdr --host desktop ping
-gdr get-password sudo   # or clear "not set" message
-gdr token create desktop --label agent --scope screenshot,mouse --expires 30d
-gdr audit desktop --lines 50
+gdr device add home --address … --token "$T" --label "home computer" --ask-sudo
+gdr --dev "home computer" ping
+gdr screenshot                    # default_host
+gdr get-password sudo --host home
+gdr service status                # systemd --user gdrd
+gdr mcp setup-cursor --dev "home computer" --per-device
+gdr pkg info
 ```
 
 See [docs/CONFIG.md](./docs/CONFIG.md) and [docs/TOKENS.md](./docs/TOKENS.md).
@@ -77,14 +79,34 @@ cargo build --release -p gdrd
 
 **Controller** (for `gdr`): `cargo build --release -p gdr` — no GStreamer needed.
 
+## System package + Cursor MCP
+
+```bash
+# Full apt/dnf package (gdr + gdrd + gdr-mcp); --host enables systemd daemon
+GDR_YES=1 GDR_SUDO_PASSWORD='…' ./scripts/install.sh --host --mcp-cursor
+
+# After code changes
+./scripts/update-package.sh
+./scripts/update-mcp.sh --restart-cursor
+
+# Coding-tool MCP only (Cursor global ~/.cursor/mcp.json)
+./scripts/setup-mcp-cursor.sh
+```
+
+See [docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md).
+
 ## Day-2 ops
 
 | Task | Command |
 |---|---|
-| Update binary | `./scripts/update.sh user@host --source` |
+| Install system package | `./scripts/install.sh [--host] [--mcp-cursor]` |
+| Update package (code changed) | `./scripts/update-package.sh` |
+| Update MCP (+ optional Cursor restart) | `./scripts/update-mcp.sh --restart-cursor` |
+| Cursor MCP setup | `./scripts/setup-mcp-cursor.sh` |
+| Update remote binary | `./scripts/update.sh user@host --source` |
 | Status | `./scripts/status.sh user@host` |
 | Rotate token | `./scripts/rotate-token.sh user@host` |
-| Uninstall | `./scripts/uninstall.sh user@host` |
+| Uninstall remote | `./scripts/uninstall.sh user@host` |
 
 ## Progress & known edges
 

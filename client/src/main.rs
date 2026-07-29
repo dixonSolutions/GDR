@@ -1,4 +1,5 @@
 mod config;
+mod manage;
 mod pinning_verifier;
 mod remote_admin;
 
@@ -29,8 +30,8 @@ mod btn {
     about = "Controller CLI for gdrd (GNOME desktop remote)"
 )]
 struct Cli {
-    /// Named host profile from ~/.config/gdr/config.json
-    #[arg(long, global = true, env = "GDR_HOST")]
+    /// Device id, label, or alias from ~/.config/gdr/config.json
+    #[arg(long, global = true, env = "GDR_HOST", visible_alias = "dev")]
     host: Option<String>,
 
     /// server[:port], e.g. 192.168.1.50:7337 (overrides profile address)
@@ -80,6 +81,30 @@ enum Command {
         cmd: HostCmd,
     },
 
+    /// Manage devices (preferred alias of `host` + label/alias/sudo/token helpers).
+    Device {
+        #[command(subcommand)]
+        cmd: manage::DeviceCmd,
+    },
+
+    /// Local systemd --user gdrd service (system package).
+    Service {
+        #[command(subcommand)]
+        cmd: manage::ServiceCmd,
+    },
+
+    /// MCP / Cursor coding-tool wiring.
+    Mcp {
+        #[command(subcommand)]
+        cmd: manage::McpCmd,
+    },
+
+    /// Installed system package info / update.
+    Pkg {
+        #[command(subcommand)]
+        cmd: manage::PkgCmd,
+    },
+
     /// Manage auth tokens on a target (over SSH, admin plane).
     Token {
         #[command(subcommand)]
@@ -114,15 +139,20 @@ enum HostCmd {
     /// Add or update a remembered host profile.
     Add {
         name: String,
+        /// Host/IP for the TLS data plane. Use `local` / `localhost` for same-machine
+        /// (no LAN/Tailscale IP). Mutually exclusive with `--local`.
+        #[arg(long, conflicts_with = "local")]
+        address: Option<String>,
+        /// Same-machine profile: stores address as `local` (connects via 127.0.0.1).
         #[arg(long)]
-        address: String,
+        local: bool,
         #[arg(long, default_value_t = common::DEFAULT_PORT)]
         port: u16,
         #[arg(long)]
         token: String,
         #[arg(long)]
         pin: Option<String>,
-        /// SSH target for admin ops, e.g. user@host
+        /// SSH target for admin ops, e.g. user@host (optional for `--local`)
         #[arg(long)]
         ssh: Option<String>,
         #[arg(long)]
@@ -138,6 +168,11 @@ enum HostCmd {
         /// Make this the default host.
         #[arg(long)]
         default: bool,
+        /// Human-friendly name (also matched by --host / MCP dev=).
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long = "alias")]
+        aliases: Vec<String>,
     },
     List,
     Show { name: String },
@@ -373,10 +408,12 @@ fn response_to_result<'a>(
 }
 
 fn ssh_target_for(cfg: &config::Config, host_name: &str) -> Result<String> {
+    let name = config::find_device_name(cfg, host_name)
+        .with_context(|| format!("unknown device '{host_name}'"))?;
     let p = cfg
         .hosts
-        .get(host_name)
-        .with_context(|| format!("unknown host '{host_name}'"))?;
+        .get(&name)
+        .with_context(|| format!("unknown host '{name}'"))?;
     Ok(p.ssh_target())
 }
 
@@ -386,6 +423,7 @@ fn run_host_cmd(cmd: HostCmd, json: bool) -> Result<()> {
         HostCmd::Add {
             name,
             address,
+            local,
             port,
             token,
             pin,
@@ -395,7 +433,15 @@ fn run_host_cmd(cmd: HostCmd, json: bool) -> Result<()> {
             ask_sudo,
             ask_user,
             default,
+            label,
+            aliases,
         } => {
+            let address = if local {
+                // Stored as localhost so even older resolvers (no alias map) work.
+                "localhost".to_string()
+            } else {
+                address.context("pass --address <host> or --local for same-machine")?
+            };
             if ask_sudo {
                 sudo_password = Some(rpassword::prompt_password("sudo password: ")?);
             }
@@ -403,13 +449,15 @@ fn run_host_cmd(cmd: HostCmd, json: bool) -> Result<()> {
                 user_password = Some(rpassword::prompt_password("user password: ")?);
             }
             let profile = HostProfile {
-                address,
+                address: address.clone(),
                 port,
                 token,
                 pin,
                 ssh,
                 sudo_password,
                 user_password,
+                label,
+                aliases,
             };
             config::upsert_host(&mut cfg, &name, profile);
             if default {
@@ -419,11 +467,22 @@ fn run_host_cmd(cmd: HostCmd, json: bool) -> Result<()> {
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({"ok": true, "host": name, "path": config::config_path()?.display().to_string()})
+                    serde_json::json!({
+                        "ok": true,
+                        "host": name,
+                        "address": address,
+                        "same_machine": config::is_loopback_alias(&address),
+                        "path": config::config_path()?.display().to_string()
+                    })
                 );
             } else {
+                let where_ = if config::is_loopback_alias(&address) {
+                    "same machine (loopback)"
+                } else {
+                    address.as_str()
+                };
                 println!(
-                    "saved host '{name}' to {}",
+                    "saved host '{name}' → {where_} in {}",
                     config::config_path()?.display()
                 );
             }
@@ -451,9 +510,13 @@ fn run_host_cmd(cmd: HostCmd, json: bool) -> Result<()> {
                     } else {
                         "user=-"
                     };
+                    let endpoint = if config::is_loopback_alias(&p.address) {
+                        format!("{} → {}", p.address, p.addr_port())
+                    } else {
+                        p.addr_port()
+                    };
                     println!(
-                        "{name}{def}  {}  pin={}  ssh={}  {sudo} {user}",
-                        p.addr_port(),
+                        "{name}{def}  {endpoint}  pin={}  ssh={}  {sudo} {user}",
                         &pin[..pin.len().min(12)],
                         p.ssh_target()
                     );
@@ -588,6 +651,10 @@ async fn main() -> Result<()> {
 
     match &cli.cmd {
         Command::Host { cmd } => return run_host_cmd(cmd.clone(), json),
+        Command::Device { cmd } => return manage::run_device(cmd.clone(), json),
+        Command::Service { cmd } => return manage::run_service(cmd.clone()),
+        Command::Mcp { cmd } => return manage::run_mcp(cmd.clone()),
+        Command::Pkg { cmd } => return manage::run_pkg(cmd.clone()),
         Command::Token { cmd } => return run_token_cmd(cmd.clone(), json),
         Command::Audit {
             host,
@@ -786,6 +853,10 @@ async fn main() -> Result<()> {
         ),
         Command::Batch
         | Command::Host { .. }
+        | Command::Device { .. }
+        | Command::Service { .. }
+        | Command::Mcp { .. }
+        | Command::Pkg { .. }
         | Command::Token { .. }
         | Command::Audit { .. }
         | Command::GetPassword { .. } => unreachable!(),

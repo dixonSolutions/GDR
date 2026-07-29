@@ -14,6 +14,9 @@ use display::SharedDisplay;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+
+/// Last absolute pointer position from `MouseMove` (shared across connections).
+type CursorState = Arc<tokio::sync::Mutex<Option<(f64, f64)>>>;
 use tokio_rustls::rustls::pki_types::PrivateKeyDer;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
@@ -57,10 +60,21 @@ struct Args {
     #[arg(long)]
     seed_token: bool,
 
-    /// Skip opening the Mutter display provider at startup (control-plane
-    /// only; screenshots/input will fail until a provider is available).
+    /// Never open Mutter ScreenCast (control-plane only: Ping/Auth work;
+    /// screenshots/input fail).
     #[arg(long)]
     no_display: bool,
+
+    /// Open Mutter ScreenCast at gdrd startup (old always-on behavior).
+    /// Useful on headless hosts so Meta-* exists before the first client.
+    #[arg(long, env = "GDR_EAGER_DISPLAY")]
+    eager_display: bool,
+
+    /// Seconds without screenshot/input before tearing down physical
+    /// ScreenCast. Default 45. `0` = never idle-stop once started.
+    /// Platform virtual monitors are never idle-stopped (see HEADLESS.md).
+    #[arg(long, env = "GDR_DISPLAY_IDLE_SECS", default_value_t = 45)]
+    display_idle_secs: u64,
 }
 
 fn expand_home(p: &str) -> PathBuf {
@@ -126,40 +140,51 @@ async fn main() -> Result<()> {
         args.audit_path.unwrap_or_else(AuditLog::default_path),
     ));
 
-    // Long-lived display: physical monitor if present, else we *become*
-    // the display via RecordVirtual is-platform + PipeWire negotiation.
+    // Display/ScreenCast: lazy by default — no broadcast until a client
+    // actually needs screenshot/input; physical sessions idle-stop.
     let display: Option<SharedDisplay> = if args.no_display {
-        tracing::warn!("--no-display: Mutter session not opened at startup");
+        tracing::warn!("--no-display: Mutter ScreenCast disabled");
         None
     } else {
-        match display::DisplayProvider::start(
-            args.connector.as_deref(),
-            capture::CaptureSize {
+        let mgr = display::DisplayManager::new(display::DisplayConfig {
+            connector: args.connector.clone(),
+            size: capture::CaptureSize {
                 width: args.width,
                 height: args.height,
             },
-        )
-        .await
-        {
-            Ok(p) => {
-                tracing::info!(
-                    "display provider ready (virtual={}, node={}, {}x{})",
-                    p.is_virtual(),
-                    p.node_id(),
-                    p.size().width,
-                    p.size().height
-                );
-                Some(Arc::new(tokio::sync::Mutex::new(p)))
+            idle_secs: args.display_idle_secs,
+            keep_virtual: true,
+        });
+        let shared = Arc::new(tokio::sync::Mutex::new(mgr));
+        if args.eager_display {
+            let mut g = shared.lock().await;
+            if let Err(e) = g.warm_start().await {
+                tracing::error!("eager display start failed: {e:#}");
             }
-            Err(e) => {
-                // Still serve the control plane; first screenshot will error
-                // with a clear message. Avoid taking down gdrd if Mutter
-                // briefly isn't ready at boot.
-                tracing::error!("display provider failed to start: {e:#}");
-                None
-            }
+        } else {
+            tracing::info!(
+                "display lazy (idle_stop={}s for physical monitors; first \
+                 screenshot/input opens Mutter)",
+                args.display_idle_secs
+            );
         }
+        // Periodic idle reap — authority for "not broadcasting 24/7".
+        if args.display_idle_secs > 0 {
+            let watch = shared.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    watch.lock().await.idle_reap().await;
+                }
+            });
+        }
+        Some(shared)
     };
+
+    // Last absolute pointer from MouseMove — Mutter RD has no live query.
+    let cursor: CursorState = Arc::new(tokio::sync::Mutex::new(None));
 
     let listener = TcpListener::bind(&args.bind).await?;
     tracing::info!(
@@ -175,6 +200,7 @@ async fn main() -> Result<()> {
         let store = store.clone();
         let audit = audit.clone();
         let display = display.clone();
+        let cursor = cursor.clone();
         let peer_s = peer.to_string();
 
         tokio::spawn(async move {
@@ -196,7 +222,8 @@ async fn main() -> Result<()> {
                 }
             };
             if let Err(e) =
-                handle_connection(tls_stream, &store, &audit, &peer_s, display.as_ref()).await
+                handle_connection(tls_stream, &store, &audit, &peer_s, display.as_ref(), &cursor)
+                    .await
             {
                 tracing::warn!("connection {peer_s} ended: {e}");
             }
@@ -210,6 +237,7 @@ async fn handle_connection(
     audit: &AuditLog,
     peer: &str,
     display: Option<&SharedDisplay>,
+    cursor: &CursorState,
 ) -> Result<()> {
     let auth_info = authenticate(&mut stream, store, audit, peer).await?;
 
@@ -267,7 +295,7 @@ async fn handle_connection(
             }
         }
 
-        let resp = match handle_request(req, display).await {
+        let resp = match handle_request(req, display, cursor).await {
             Ok(r) => r,
             Err(e) => Response::Error {
                 message: e.to_string(),
@@ -330,21 +358,42 @@ fn request_name(req: &Request) -> &'static str {
         Request::MouseScroll { .. } => "MouseScroll",
         Request::KeyEvent { .. } => "KeyEvent",
         Request::TypeText { .. } => "TypeText",
+        Request::GetCursor => "GetCursor",
         Request::Ping => "Ping",
     }
 }
 
-async fn handle_request(req: Request, display: Option<&SharedDisplay>) -> Result<Response> {
+async fn handle_request(
+    req: Request,
+    display: Option<&SharedDisplay>,
+    cursor: &CursorState,
+) -> Result<Response> {
     match req {
         Request::Auth { .. } => Ok(Response::Error {
             message: "already authenticated".into(),
         }),
         Request::Ping => Ok(Response::Pong),
 
+        Request::GetCursor => {
+            let pos = cursor.lock().await;
+            match *pos {
+                Some((x, y)) => Ok(Response::CursorPosition {
+                    x,
+                    y,
+                    known: true,
+                }),
+                None => Ok(Response::CursorPosition {
+                    x: 0.0,
+                    y: 0.0,
+                    known: false,
+                }),
+            }
+        }
+
         Request::Screenshot { .. } => {
             let display = display
                 .ok_or_else(|| anyhow::anyhow!("display provider not available"))?;
-            let guard = display.lock().await;
+            let mut guard = display.lock().await;
             let png = guard.capture_png().await?;
             let png_base64 = base64::engine::general_purpose::STANDARD.encode(&png);
             Ok(Response::Screenshot { png_base64 })
@@ -353,20 +402,22 @@ async fn handle_request(req: Request, display: Option<&SharedDisplay>) -> Result
         Request::MouseMove { x, y } => {
             let display = display
                 .ok_or_else(|| anyhow::anyhow!("display provider not available"))?;
-            let guard = display.lock().await;
-            let s = guard.session();
+            let mut guard = display.lock().await;
+            let s = guard.session().await?;
             s.rd_session
                 .notify_pointer_motion_absolute(&s.stream_id, x, y)
                 .await?;
+            *cursor.lock().await = Some((x, y));
             Ok(Response::Ok)
         }
 
         Request::MouseButton { button, pressed } => {
             let display = display
                 .ok_or_else(|| anyhow::anyhow!("display provider not available"))?;
-            let guard = display.lock().await;
+            let mut guard = display.lock().await;
             guard
                 .session()
+                .await?
                 .rd_session
                 .notify_pointer_button(button, pressed)
                 .await?;
@@ -376,9 +427,10 @@ async fn handle_request(req: Request, display: Option<&SharedDisplay>) -> Result
         Request::MouseScroll { dx, dy } => {
             let display = display
                 .ok_or_else(|| anyhow::anyhow!("display provider not available"))?;
-            let guard = display.lock().await;
+            let mut guard = display.lock().await;
             guard
                 .session()
+                .await?
                 .rd_session
                 .notify_pointer_axis(dx, dy, 0)
                 .await?;
@@ -388,9 +440,10 @@ async fn handle_request(req: Request, display: Option<&SharedDisplay>) -> Result
         Request::KeyEvent { keycode, pressed } => {
             let display = display
                 .ok_or_else(|| anyhow::anyhow!("display provider not available"))?;
-            let guard = display.lock().await;
+            let mut guard = display.lock().await;
             guard
                 .session()
+                .await?
                 .rd_session
                 .notify_keyboard_keycode(keycode, pressed)
                 .await?;
@@ -400,8 +453,8 @@ async fn handle_request(req: Request, display: Option<&SharedDisplay>) -> Result
         Request::TypeText { text } => {
             let display = display
                 .ok_or_else(|| anyhow::anyhow!("display provider not available"))?;
-            let guard = display.lock().await;
-            let s = guard.session();
+            let mut guard = display.lock().await;
+            let s = guard.session().await?;
             const KEY_LEFTSHIFT: u32 = 42;
             for c in text.chars() {
                 if let Some((code, needs_shift)) = common::keymap::ascii_to_evdev(c) {

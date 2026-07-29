@@ -11,7 +11,7 @@ The root [`README.md`](../README.md) is the quick-start; everything here goes de
 | [CONFIG.md](./CONFIG.md) | `~/.config/gdr/config.json`, tokens.json, env vars |
 | [TOKENS.md](./TOKENS.md) | Multi-token lifecycle, scopes, expiry, revocation |
 | [MCP.md](./MCP.md) | MCP tools, password tool tradeoff, host resolution |
-| [DEPLOYMENT.md](./DEPLOYMENT.md) | `deploy.sh`, systemd, Tailscale/SSH targets |
+| [DEPLOYMENT.md](./DEPLOYMENT.md) | `deploy.sh`, system `.deb`/`.rpm`, MCP Cursor setup, systemd |
 | [TESTING.md](./TESTING.md) | Unit tests, how we E2E against a real GNOME host |
 | [PROGRESS.md](./PROGRESS.md) | What is built, what is next, open decisions |
 | [SECURITY.md](./SECURITY.md) | Secrets handling, what never goes in git |

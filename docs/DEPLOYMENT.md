@@ -62,14 +62,72 @@ appear in `ps`. First bootstrap still conceptually needs a password
 7. `systemctl --user enable --now gdr.service`  
 8. Print token + cert fingerprint; optionally save controller profile  
 
+## System package install (apt / dnf)
+
+Preferred on a machine you develop on or permanently control. Builds from the
+current tree, produces a real `.deb` or `.rpm`, and installs via the distro
+package manager (`dpkg` / `dnf`). Ships **full CLI** (`gdr`), **daemon**
+(`gdrd`), **MCP** (`gdr-mcp` + `/usr/share/gdr/mcp-server`), and a systemd
+**user** unit template.
+
+```bash
+# Controller + binaries + MCP package
+GDR_YES=1 GDR_SUDO_PASSWORD='…' ./scripts/install.sh
+
+# Also enable host daemon (systemd --user) + local profile + Cursor MCP
+GDR_YES=1 GDR_SUDO_PASSWORD='…' ./scripts/install.sh --host --mcp-cursor
+```
+
+| Flag / env | Meaning |
+|---|---|
+| `--host` / `--daemon` | `systemctl --user enable --now gdr.service`, seed token, write profile |
+| `--mcp-cursor` | merge `gdr` into `~/.cursor/mcp.json` |
+| `GDR_BIND` | daemon bind (default `0.0.0.0:7337`) |
+| `GDR_PROFILE_NAME` | profile name when `--host` (default `local`) |
+| `GDR_SKIP_DEPS=1` | skip apt/dnf dependency install |
+
+Packages land in `dist/packages/` (e.g. `gdr_0.1.0_amd64.deb`).
+
+## Same-machine (user-local, no .deb)
+
+Lightweight alternative without packaging:
+
+```bash
+./scripts/install-local.sh
+# → binds 127.0.0.1:7337, seeds token, writes profile `local`
+gdr --host local ping
+```
+
+## Coding-tool MCP (Cursor global)
+
+```bash
+./scripts/setup-mcp-cursor.sh           # /usr/bin/gdr-mcp or repo dist
+./scripts/setup-mcp-cursor.sh --system  # force packaged gdr-mcp
+./scripts/setup-mcp-cursor.sh --repo --restart
+```
+
+Multi-host tokens stay in `~/.config/gdr/config.json`; tools take `host=`.
+
 ## Day-2 scripts
 
 | Script | Purpose |
 |---|---|
-| `scripts/update.sh user@host [--source]` | Replace binary, restart |
+| `scripts/install.sh` | Build + install system `.deb`/`.rpm` (full stack) |
+| `scripts/update-package.sh` | Rebuild from code changes + reinstall package |
+| `scripts/update-mcp.sh [--restart-cursor]` | Rebuild MCP; optional AI-host MCP restart |
+| `scripts/setup-mcp-cursor.sh` | Cursor global `~/.cursor/mcp.json` |
+| `scripts/install-local.sh` | User-local gdrd only (loopback + `local` profile) |
+| `scripts/update.sh user@host [--source]` | Replace remote binary, restart |
 | `scripts/status.sh user@host` | unit status, fingerprint, logs |
 | `scripts/rotate-token.sh user@host` | new GDR_TOKEN + seed |
 | `scripts/uninstall.sh user@host` | stop unit, remove binary + `~/.local/share/gdr` |
+
+After local code changes:
+
+```bash
+./scripts/update-package.sh              # gdr + gdrd + MCP package
+./scripts/update-mcp.sh --restart-cursor # MCP-only + kill Cursor MCP process
+```
 
 ## Cert rotation
 

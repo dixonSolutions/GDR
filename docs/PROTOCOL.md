@@ -27,6 +27,7 @@ The TypeScript mirror is [`mcp-server/src/gdrClient.ts`](../mcp-server/src/gdrCl
 | `MouseScroll` | `dx, dy: f64` | `mouse` |
 | `KeyEvent` | `keycode: u32` (evdev), `pressed: bool` | `keyboard` |
 | `TypeText` | `text: string` | `type` |
+| `GetCursor` | — | `mouse` |
 | `Ping` | — | none (auth only) |
 
 Button constants: `0x110` left, `0x111` right, `0x112` middle.
@@ -41,6 +42,7 @@ Button constants: `0x110` left, `0x111` right, `0x112` middle.
 | `Ok` | mutation succeeded |
 | `Pong` | ping reply |
 | `Screenshot` | `png_base64: string` |
+| `CursorPosition` | `x, y: f64`, `known: bool` (last `MouseMove`; false if none yet) |
 | `Error` | `message: string` (including permission denied) |
 
 ## Auth + scopes

@@ -104,6 +104,7 @@ pub trait ScreenCastStream {
 pub struct MutterSession {
     pub conn: Connection,
     pub rd_session: RemoteDesktopSessionProxy<'static>,
+    pub sc_session: ScreenCastSessionProxy<'static>,
     pub sc_stream: ScreenCastStreamProxy<'static>,
     /// Object path of the screencast stream, as a string - this is what
     /// gets passed as the `stream` argument to NotifyPointerMotionAbsolute
@@ -207,12 +208,23 @@ impl MutterSession {
             Self {
                 conn,
                 rd_session,
+                sc_session,
                 sc_stream,
                 stream_id,
                 pipewire_node: std::sync::Mutex::new(pipewire_node),
             },
             used_platform_virtual,
         ))
+    }
+
+    /// Stop RemoteDesktop + ScreenCast sessions (ends PipeWire export).
+    pub async fn shutdown(self) {
+        if let Err(e) = self.rd_session.stop().await {
+            tracing::debug!("RemoteDesktop.Session.Stop: {e}");
+        }
+        if let Err(e) = self.sc_session.stop().await {
+            tracing::debug!("ScreenCast.Session.Stop: {e}");
+        }
     }
 
     /// Returns the PipeWire node id for this stream, waiting if needed.
@@ -247,14 +259,23 @@ async fn pick_stream(
         return Ok((path, false));
     }
 
-    let connectors = discover_connectors().await.unwrap_or_default();
-    for c in &connectors {
+    let connectors = discover_connectors().await.unwrap_or_else(|e| {
+        tracing::warn!("discover_connectors failed: {e:#}");
+        Vec::new()
+    });
+    // Prefer real DRM outputs; Meta-/Virtual- are our own headless fallbacks.
+    let mut ordered = connectors.clone();
+    ordered.sort_by_key(|c| is_virtual_connector(c) as u8);
+    for c in &ordered {
+        if is_virtual_connector(c) {
+            continue;
+        }
         match sc_session.record_monitor(c, stream_props()).await {
             Ok(path) => {
                 tracing::info!("recording monitor connector={c}");
                 return Ok((path, false));
             }
-            Err(e) => tracing::debug!("record_monitor({c}): {e}"),
+            Err(e) => tracing::warn!("record_monitor({c}): {e}"),
         }
     }
 
@@ -263,7 +284,7 @@ async fn pick_stream(
     // (shows up as Meta-N in DisplayConfig) — same approach as
     // gnome-remote-desktop's headless path.
     tracing::warn!(
-        "no usable monitor connectors ({:?}); using RecordVirtual is-platform 1920x1080",
+        "no usable physical monitor connectors ({:?}); using RecordVirtual is-platform 1920x1080",
         connectors
     );
     let mut props = stream_props();
@@ -320,53 +341,51 @@ async fn discover_connectors() -> Result<Vec<String>> {
         .await
         .context("GetCurrentState")?;
 
-    let owned: zbus::zvariant::OwnedValue = reply
+    // Mutter GetCurrentState:
+    //   (u, a((ssss)a(siiddada{sv})a{sv}), a(iiduba(ssss)a{sv}), a{sv})
+    type Mode = (
+        String,
+        i32,
+        i32,
+        f64,
+        f64,
+        Vec<f64>,
+        std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    );
+    type Spec = (String, String, String, String);
+    type Monitor = (
+        Spec,
+        Vec<Mode>,
+        std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    );
+    type Logical = (
+        i32,
+        i32,
+        f64,
+        u32,
+        bool,
+        Vec<Spec>,
+        std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    );
+
+    let (_serial, monitors, _logical, _props): (
+        u32,
+        Vec<Monitor>,
+        Vec<Logical>,
+        std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    ) = reply
         .body()
         .deserialize()
-        .context("body → OwnedValue")?;
-    let value = zbus::zvariant::Value::from(owned);
-    let mut out = Vec::new();
-    extract_connectors(&value, &mut out, 0);
+        .context("deserialize GetCurrentState")?;
+
+    let out: Vec<String> = monitors.into_iter().map(|m| m.0 .0).collect();
     if out.is_empty() {
-        Err(anyhow!("zero connectors parsed from DisplayConfig"))
+        Err(anyhow!("zero connectors from DisplayConfig"))
     } else {
-        let mut seen = std::collections::HashSet::new();
-        out.retain(|c| seen.insert(c.clone()));
         Ok(out)
     }
 }
 
-fn extract_connectors(value: &zbus::zvariant::Value<'_>, out: &mut Vec<String>, depth: usize) {
-    if depth > 8 {
-        return;
-    }
-    match value {
-        zbus::zvariant::Value::Structure(st) => {
-            let fields = st.fields();
-            if let Some(zbus::zvariant::Value::Str(s)) = fields.first() {
-                let name = s.as_str();
-                if looks_like_connector(name) {
-                    out.push(name.to_string());
-                    return;
-                }
-            }
-            for f in fields {
-                extract_connectors(f, out, depth + 1);
-            }
-        }
-        zbus::zvariant::Value::Array(arr) => {
-            for item in arr.iter() {
-                extract_connectors(item, out, depth + 1);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn looks_like_connector(name: &str) -> bool {
-    let prefixes = [
-        "eDP-", "DP-", "HDMI-", "HDMI-A-", "VGA-", "DVI-", "USB-C-", "Virtual-", "Wayland-",
-        "Meta-",
-    ];
-    prefixes.iter().any(|p| name.starts_with(p))
+fn is_virtual_connector(name: &str) -> bool {
+    name.starts_with("Meta-") || name.starts_with("Virtual-")
 }

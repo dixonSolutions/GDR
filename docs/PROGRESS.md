@@ -53,6 +53,19 @@ Living checklist. Update this when a milestone lands or a decision flips.
 - [x] Screenshots pull from same appsink (no second pipewiresrc)
 - [x] E2E on headless host: **1920×1080 PNG**, `Meta-0` logical monitor up
 
+### 2026-07-29 — no 24/7 screen broadcast
+
+- [x] gdrd lazy Mutter ScreenCast (on first screenshot/input)
+- [x] Physical idle-stop (`--display-idle-secs` / `GDR_DISPLAY_IDLE_SECS`, default 45)
+- [x] Virtual/headless Meta-* kept once started; `--eager-display` for boot
+- [x] MCP TLS idle disconnect (`GDR_MCP_IDLE_MS`, default 15s)
+- [x] Docs: SECURITY / HEADLESS / MCP privacy notes
+
+### 2026-07-29 — `@gdr -dev=` agent convention
+
+- [x] `.cursor/rules/gdr-device.mdc` — parse chat `-dev=`, status + screenshot
+- [x] MCP `gdr_status`, `gdr_device_add` / `remove` / `default`
+
 ### Still open / next
 
 - [ ] Optional: `gdr_run_privileged` MCP tool
@@ -60,13 +73,19 @@ Living checklist. Update this when a milestone lands or a decision flips.
 - [ ] Optional: xkbcommon typing; normalized 0..1 coordinates
 - [ ] Optional: public git remote + clone-based install (today: rsync)
 - [ ] Mutter consent dialog behavior on this GNOME 50 host when a panel is attached
+- [ ] Optionally prune Cursor `--per-device` MCP entries to a single `gdr`
 
 ### Reference deployment
 
 | Role | Machine |
 |---|---|
 | Target | `borys@100.118.238.2` — Debian, GNOME 50.2 Wayland, linger on |
-| Controller | local `eva` — `gdr` CLI + config profile `desktop` |
+| Controller | local `eva` — `gdr` CLI + profiles `desktop` (remote) and `local` (loopback) |
+| Same-machine | `scripts/install-local.sh` + address aliases `local`/`localhost`; Cursor MCP `~/.cursor/mcp.json` → `gdr` |
+| Physical display | Fixed `GetCurrentState` connector parse — local `gdrd` records primary monitor (e.g. DP-6), not only Meta virtual |
+| MCP input v2 | `gdr_hotkey`, `gdr_input` (chords/sequences), `gdr_double_click` / `clicks=`, `gdr_cursor` + protocol `GetCursor` |
+| Packaging | `scripts/install.sh` → apt/dnf `.deb`/`.rpm`; `update-package.sh`, `update-mcp.sh --restart-cursor`, `setup-mcp-cursor.sh` |
+| Devices + mgmt CLI | labels/aliases; MCP `--dev` / tool `dev=`; `gdr device|service|mcp|pkg` |
 
 Secrets (token, sudo password, cert pin) live only in
 `~/.config/gdr/config.json` on the controller and the target’s unit /
