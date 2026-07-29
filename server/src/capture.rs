@@ -28,9 +28,14 @@ pub struct KeepaliveConsumer {
 }
 
 impl KeepaliveConsumer {
+    /// Start a long-lived PipeWire consumer.
+    ///
+    /// When `width`/`height` are both `> 0`, appsink caps pin that size
+    /// (needed for headless Meta-* negotiation). When either is `0`, only
+    /// `format=RGBA` is required so physical panels can keep native size.
     pub fn start(node_id: u32, width: i32, height: i32) -> Result<Self> {
         // Same shape as the proven Python probe:
-        //   pipewiresrc ! videoconvert ! appsink(caps=RGBA,WxH)
+        //   pipewiresrc ! videoconvert ! appsink(caps=RGBA[,WxH])
         let src = gst::ElementFactory::make("pipewiresrc")
             .name("src")
             .property("path", format!("{node_id}"))
@@ -50,11 +55,17 @@ impl KeepaliveConsumer {
             // (static headless Meta-* often stops pushing).
             .property("enable-last-sample", true)
             .build()?;
-        let caps = gst::Caps::builder("video/x-raw")
-            .field("format", "RGBA")
-            .field("width", width)
-            .field("height", height)
-            .build();
+        let caps = if width > 0 && height > 0 {
+            gst::Caps::builder("video/x-raw")
+                .field("format", "RGBA")
+                .field("width", width)
+                .field("height", height)
+                .build()
+        } else {
+            gst::Caps::builder("video/x-raw")
+                .field("format", "RGBA")
+                .build()
+        };
         sink.set_property("caps", &caps);
 
         let pipeline = gst::Pipeline::default();

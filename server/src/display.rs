@@ -31,25 +31,31 @@ impl DisplayProvider {
         let (session, is_virtual) = MutterSession::open_with_info(connector).await?;
         let node_id = session.wait_for_pipewire_node().await?;
 
-        if is_virtual {
+        let (w, h) = if is_virtual {
             tracing::info!(
                 "no physical monitor — acting as display via platform virtual \
                  monitor, negotiating {}x{}",
                 size.width,
                 size.height
             );
-            let w = size.width;
-            let h = size.height;
-            // GStreamer negotiation is blocking; run off the async runtime.
-            let consumer = tokio::task::spawn_blocking(move || {
-                KeepaliveConsumer::start(node_id, w, h)
-            })
-            .await
-            .context("keepalive join")??;
-            capture::install_keepalive(consumer);
+            (size.width, size.height)
         } else {
-            tracing::info!("using physical/monitor stream pipewire node={node_id}");
-        }
+            tracing::info!(
+                "using physical/monitor stream pipewire node={node_id} \
+                 (native resolution; not forcing {}x{})",
+                size.width,
+                size.height
+            );
+            // 0,0 → RGBA-only caps so eDP panels keep their native size.
+            (0, 0)
+        };
+        // GStreamer negotiation is blocking; run off the async runtime.
+        let consumer = tokio::task::spawn_blocking(move || {
+            KeepaliveConsumer::start(node_id, w, h)
+        })
+        .await
+        .context("keepalive join")??;
+        capture::install_keepalive(consumer);
 
         Ok(Self {
             session,
