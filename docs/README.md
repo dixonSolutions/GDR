@@ -16,7 +16,7 @@ The root [`README.md`](../README.md) is the quick-start; everything here goes de
 | [PROGRESS.md](./PROGRESS.md) | What is built, what is next, open decisions |
 | [SECURITY.md](./SECURITY.md) | Secrets handling, what never goes in git |
 | [HEADLESS.md](./HEADLESS.md) | No-monitor targets, virtual Meta-* fallback, 1×1 caveat |
-| [data/captures/](./data/captures/) | Runtime gdr screenshots (gitignored PNGs) |
+| `data/` (local only) | Runtime gdr screenshots under `docs/data/captures/` — gitignored |
 
 **Audience split**
 
