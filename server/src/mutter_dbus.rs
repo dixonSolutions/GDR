@@ -115,10 +115,15 @@ pub struct MutterSession {
 
 impl MutterSession {
     /// Opens a RemoteDesktop session (for input injection) plus a linked
-    /// ScreenCast session recording the given monitor connector (e.g.
-    /// "eDP-1"; pass None to auto-pick, or create a platform virtual
-    /// monitor when the machine has no physical displays).
+    /// ScreenCast session. Prefer [`Self::open_with_info`] when the caller
+    /// needs to know whether a platform virtual monitor was used.
     pub async fn open(connector: Option<&str>) -> Result<Self> {
+        Ok(Self::open_with_info(connector).await?.0)
+    }
+
+    /// Like [`Self::open`], also returning whether we fell back to
+    /// `RecordVirtual { is-platform }` (headless / no physical monitor).
+    pub async fn open_with_info(connector: Option<&str>) -> Result<(Self, bool)> {
         let conn = Connection::session().await?;
 
         let rd = RemoteDesktopProxy::new(&conn).await?;
@@ -171,13 +176,11 @@ impl MutterSession {
             Ok(()) => {}
             Err(e) => {
                 let msg = e.to_string();
-                // Already started by RD.Start — fine.
                 if !msg.contains("already started") && !msg.contains("Already started") {
                     tracing::warn!("ScreenCast.Stream.Start after RD.Start: {msg}");
                 }
             }
         }
-        let _ = used_platform_virtual;
 
         let node = tokio::time::timeout(Duration::from_secs(5), signals.next())
             .await
@@ -193,16 +196,23 @@ impl MutterSession {
         if pipewire_node.is_none() {
             tracing::warn!("no PipeWire node id yet; will retry on first screenshot");
         } else {
-            tracing::info!("PipeWire node id={:?}", pipewire_node);
+            tracing::info!(
+                "PipeWire node id={:?} virtual={}",
+                pipewire_node,
+                used_platform_virtual
+            );
         }
 
-        Ok(Self {
-            conn,
-            rd_session,
-            sc_stream,
-            stream_id,
-            pipewire_node: std::sync::Mutex::new(pipewire_node),
-        })
+        Ok((
+            Self {
+                conn,
+                rd_session,
+                sc_stream,
+                stream_id,
+                pipewire_node: std::sync::Mutex::new(pipewire_node),
+            },
+            used_platform_virtual,
+        ))
     }
 
     /// Returns the PipeWire node id for this stream, waiting if needed.

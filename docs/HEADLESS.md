@@ -1,48 +1,55 @@
 # Headless / no-monitor targets
 
-## What we saw on `borys@100.118.238.2` (2026-07-29)
+## Goal
 
-- GNOME Shell 50.2, Wayland session active, linger enabled.
-- **All DRM connectors disconnected** (`card0-DP-*` / `HDMI-A-*` = disconnected).
-- `org.gnome.Mutter.DisplayConfig.GetCurrentState` returns **zero** monitors
-  until a platform virtual monitor is created.
-- Physical `RecordMonitor("eDP-1"|…)` → `Unknown monitor`.
+When the GNOME session has **no physical monitor**, gdrd should **act as
+the display**: create a platform virtual monitor (`Meta-*`) the session
+actually uses, negotiate a real resolution over PipeWire, and capture that.
 
-## How gdrd adapts
+## How it works (implemented)
 
-When no connector is usable, `MutterSession::open` falls back to:
+On startup, `DisplayProvider`:
+
+1. Opens Mutter RemoteDesktop + ScreenCast (linked session).
+2. If no connector is usable → `RecordVirtual { is-platform: true, width, height, cursor-mode }`.
+3. Starts a long-lived GStreamer consumer:
+   `pipewiresrc ! videoconvert ! appsink(caps=RGBA,1920x1080)`.
+4. Mutter sizes the virtual monitor from that **PipeWire negotiation**
+   (not from the D-Bus width/height hints alone).
+5. Screenshots pull frames from the **same appsink** (a second
+   `pipewiresrc` on the same node will stall).
+
+Logs you want to see:
 
 ```
-RecordVirtual({ is-platform: true, width: 1920, height: 1080, cursor-mode: 1 })
+no physical monitor — acting as display via platform virtual monitor, negotiating 1920x1080
+keepalive negotiated 1920x1080 on pipewire node …
+display provider ready (virtual=true, node=…, 1920x1080)
 ```
 
-That is the same headless approach gnome-remote-desktop uses: Mutter creates
-a `Meta-N` “Virtual remote monitor”. Input injection (move/click/type) works
-against that stream.
+`DisplayConfig` should then show `Meta-0` with one logical monitor while
+gdrd is running.
 
-## Capture quality caveat
+## Verified (2026-07-29, `borys@100.118.238.2`)
 
-On a machine with **no real framebuffer** (no physical panel and no prior
-virtual monitor already driving a desktop), the PipeWire node can still
-negotiate and deliver frames that are effectively **1×1**. The protocol,
-auth, scopes, and PNG pipeline are fine — there is simply nothing useful to
-photograph until a display exists.
+- Host: all DRM connectors disconnected, GNOME 50.2 Wayland.
+- After deploy: `Meta-0` present, `logical=1`.
+- `gdr --host desktop screenshot` → **1920×1080 PNG** (~178 KiB).
+- `move` / `click` / `ping` still ok on the virtual stream.
 
-### Make screenshots useful
+## Tunables
 
-1. **Plug in a monitor** (or enable a dock/display), or  
-2. Drive a persistent virtual monitor (e.g. run gnome-remote-desktop headless,
-   or a dummy DRM driver), then point gdrd at that connector (`--connector Meta-0`
-   / `eDP-1` / …).
+```bash
+gdrd --width 1920 --height 1080   # default
+gdrd --connector eDP-1            # force a physical connector when present
+gdrd --no-display                 # control plane only (no Mutter session)
+```
 
-After a real connector appears, `deploy`/`gdrd` will prefer `RecordMonitor`
-automatically.
+## Failure modes
 
-## Related bugs we fixed while debugging this
-
-1. zbus `ProxyBuilder` required `.destination(...)` when binding session/
-   stream object paths — missing it produced  
-   `Parameter \`destination\` was not specified but it is required`.
-2. Start order with a linked RD+SC session: **RemoteDesktop.Start first**;
-   do not call `ScreenCast.Session.Start` (Mutter: “Must be started from
-   remote desktop session”). Stream often auto-starts with RD.
+| Symptom | Likely cause |
+|---|---|
+| 1×1 PNG | Consumer accepted placeholder size (old code); upgrade gdrd |
+| `no frame from keepalive appsink` | Pipeline not playing / caps mismatch |
+| `display provider not available` | Mutter open/negotiate failed at boot — check journal |
+| Meta-0 disappears when gdrd stops | Expected — the virtual monitor is owned by gdrd’s session |

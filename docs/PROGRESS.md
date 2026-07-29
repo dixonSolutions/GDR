@@ -46,9 +46,15 @@ Living checklist. Update this when a milestone lands or a decision flips.
 | Password tool | `gdr_get_password` as specified; safer alt documented |
 | Token admin channel | SSH only |
 
+### 2026-07-29 (later) — act as the display
+
+- [x] Long-lived `DisplayProvider` with `RecordVirtual { is-platform }`
+- [x] PipeWire negotiation via keepalive appsink at 1920×1080
+- [x] Screenshots pull from same appsink (no second pipewiresrc)
+- [x] E2E on headless host: **1920×1080 PNG**, `Meta-0` logical monitor up
+
 ### Still open / next
 
-- [ ] Plug in a monitor (or persistent virtual display) and re-verify full-res screenshots
 - [ ] Optional: `gdr_run_privileged` MCP tool
 - [ ] Optional: immediate live-session kill on revoke
 - [ ] Optional: xkbcommon typing; normalized 0..1 coordinates

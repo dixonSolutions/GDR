@@ -1,5 +1,6 @@
 mod audit;
 mod capture;
+mod display;
 mod mutter_dbus;
 mod tls;
 mod tokens;
@@ -9,7 +10,7 @@ use audit::{now_ts, AuditEvent, AuditLog};
 use base64::Engine;
 use clap::Parser;
 use common::{framing, Request, Response};
-use mutter_dbus::MutterSession;
+use display::SharedDisplay;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -25,35 +26,41 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:7337")]
     bind: String,
 
-    /// Legacy single bearer token (env GDR_TOKEN). Still accepted for
-    /// backwards compatibility; prefer tokens.json managed via
-    /// `gdr token create` / deploy.sh. When both are present, tokens.json
-    /// entries are checked first, then this env token (scope=all).
+    /// Legacy single bearer token (env GDR_TOKEN).
     #[arg(long, env = "GDR_TOKEN")]
     token: Option<String>,
 
-    /// Path to the multi-token store (hashes only).
     #[arg(long, env = "GDR_TOKENS_PATH")]
     tokens_path: Option<PathBuf>,
 
-    /// Path to the JSON-lines audit log.
     #[arg(long, env = "GDR_AUDIT_PATH")]
     audit_path: Option<PathBuf>,
 
-    /// Monitor connector to capture, e.g. "eDP-1". Leave unset to auto-pick.
+    /// Monitor connector to capture, e.g. "eDP-1". Leave unset to auto-pick
+    /// or create a platform virtual monitor when none exist.
     #[arg(long)]
     connector: Option<String>,
+
+    /// Virtual / negotiated capture width (PipeWire caps offered to Mutter).
+    #[arg(long, default_value_t = capture::DEFAULT_WIDTH)]
+    width: i32,
+
+    /// Virtual / negotiated capture height.
+    #[arg(long, default_value_t = capture::DEFAULT_HEIGHT)]
+    height: i32,
 
     #[arg(long, default_value = "~/.local/share/gdr/cert.pem")]
     cert_path: String,
     #[arg(long, default_value = "~/.local/share/gdr/key.pem")]
     key_path: String,
 
-    /// If set, write/ensure an initial tokens.json entry for --token /
-    /// GDR_TOKEN and exit. Used by deploy.sh so the hashed store is
-    /// populated without a separate admin step.
     #[arg(long)]
     seed_token: bool,
+
+    /// Skip opening the Mutter display provider at startup (control-plane
+    /// only; screenshots/input will fail until a provider is available).
+    #[arg(long)]
+    no_display: bool,
 }
 
 fn expand_home(p: &str) -> PathBuf {
@@ -119,6 +126,41 @@ async fn main() -> Result<()> {
         args.audit_path.unwrap_or_else(AuditLog::default_path),
     ));
 
+    // Long-lived display: physical monitor if present, else we *become*
+    // the display via RecordVirtual is-platform + PipeWire negotiation.
+    let display: Option<SharedDisplay> = if args.no_display {
+        tracing::warn!("--no-display: Mutter session not opened at startup");
+        None
+    } else {
+        match display::DisplayProvider::start(
+            args.connector.as_deref(),
+            capture::CaptureSize {
+                width: args.width,
+                height: args.height,
+            },
+        )
+        .await
+        {
+            Ok(p) => {
+                tracing::info!(
+                    "display provider ready (virtual={}, node={}, {}x{})",
+                    p.is_virtual(),
+                    p.node_id(),
+                    p.size().width,
+                    p.size().height
+                );
+                Some(Arc::new(tokio::sync::Mutex::new(p)))
+            }
+            Err(e) => {
+                // Still serve the control plane; first screenshot will error
+                // with a clear message. Avoid taking down gdrd if Mutter
+                // briefly isn't ready at boot.
+                tracing::error!("display provider failed to start: {e:#}");
+                None
+            }
+        }
+    };
+
     let listener = TcpListener::bind(&args.bind).await?;
     tracing::info!(
         "listening on {} (tokens={}, audit={})",
@@ -127,14 +169,12 @@ async fn main() -> Result<()> {
         audit.path().display()
     );
 
-    let connector = Arc::new(args.connector);
-
     loop {
         let (stream, peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let store = store.clone();
         let audit = audit.clone();
-        let connector = connector.clone();
+        let display = display.clone();
         let peer_s = peer.to_string();
 
         tokio::spawn(async move {
@@ -156,7 +196,7 @@ async fn main() -> Result<()> {
                 }
             };
             if let Err(e) =
-                handle_connection(tls_stream, &store, &audit, &peer_s, connector.as_deref()).await
+                handle_connection(tls_stream, &store, &audit, &peer_s, display.as_ref()).await
             {
                 tracing::warn!("connection {peer_s} ended: {e}");
             }
@@ -169,7 +209,7 @@ async fn handle_connection(
     store: &TokenStore,
     audit: &AuditLog,
     peer: &str,
-    connector: Option<&str>,
+    display: Option<&SharedDisplay>,
 ) -> Result<()> {
     let auth_info = authenticate(&mut stream, store, audit, peer).await?;
 
@@ -182,8 +222,6 @@ async fn handle_connection(
         request: Some("Auth"),
         detail: Some(&auth_info.scopes.to_string()),
     });
-
-    let mut session: Option<MutterSession> = None;
 
     loop {
         let req = match framing::read_message::<_, Request>(&mut stream).await {
@@ -229,7 +267,7 @@ async fn handle_connection(
             }
         }
 
-        let resp = match handle_request(req, &mut session, connector).await {
+        let resp = match handle_request(req, display).await {
             Ok(r) => r,
             Err(e) => Response::Error {
                 message: e.to_string(),
@@ -259,7 +297,6 @@ async fn authenticate(
     match framing::read_message::<_, Request>(stream).await? {
         Request::Auth { token } => match store.authenticate(&token) {
             Ok(info) => {
-                // Wire-compat: current clients/MCP expect `AuthOk`.
                 framing::write_message(stream, &Response::AuthOk).await?;
                 Ok(info)
             }
@@ -297,39 +334,27 @@ fn request_name(req: &Request) -> &'static str {
     }
 }
 
-async fn ensure_session<'a>(
-    session: &'a mut Option<MutterSession>,
-    connector: Option<&str>,
-) -> Result<&'a MutterSession> {
-    if session.is_none() {
-        *session = Some(MutterSession::open(connector).await?);
-    }
-    Ok(session.as_ref().unwrap())
-}
-
-async fn handle_request(
-    req: Request,
-    session: &mut Option<MutterSession>,
-    connector: Option<&str>,
-) -> Result<Response> {
+async fn handle_request(req: Request, display: Option<&SharedDisplay>) -> Result<Response> {
     match req {
         Request::Auth { .. } => Ok(Response::Error {
             message: "already authenticated".into(),
         }),
         Request::Ping => Ok(Response::Pong),
 
-        Request::Screenshot { connector: req_conn } => {
-            let conn = req_conn.as_deref().or(connector);
-            let s = ensure_session(session, conn).await?;
-            let node_id = s.wait_for_pipewire_node().await?;
-            let png = tokio::task::spawn_blocking(move || capture::capture_single_frame_png(node_id))
-                .await??;
+        Request::Screenshot { .. } => {
+            let display = display
+                .ok_or_else(|| anyhow::anyhow!("display provider not available"))?;
+            let guard = display.lock().await;
+            let png = guard.capture_png().await?;
             let png_base64 = base64::engine::general_purpose::STANDARD.encode(&png);
             Ok(Response::Screenshot { png_base64 })
         }
 
         Request::MouseMove { x, y } => {
-            let s = ensure_session(session, connector).await?;
+            let display = display
+                .ok_or_else(|| anyhow::anyhow!("display provider not available"))?;
+            let guard = display.lock().await;
+            let s = guard.session();
             s.rd_session
                 .notify_pointer_motion_absolute(&s.stream_id, x, y)
                 .await?;
@@ -337,27 +362,46 @@ async fn handle_request(
         }
 
         Request::MouseButton { button, pressed } => {
-            let s = ensure_session(session, connector).await?;
-            s.rd_session.notify_pointer_button(button, pressed).await?;
+            let display = display
+                .ok_or_else(|| anyhow::anyhow!("display provider not available"))?;
+            let guard = display.lock().await;
+            guard
+                .session()
+                .rd_session
+                .notify_pointer_button(button, pressed)
+                .await?;
             Ok(Response::Ok)
         }
 
         Request::MouseScroll { dx, dy } => {
-            let s = ensure_session(session, connector).await?;
-            s.rd_session.notify_pointer_axis(dx, dy, 0).await?;
+            let display = display
+                .ok_or_else(|| anyhow::anyhow!("display provider not available"))?;
+            let guard = display.lock().await;
+            guard
+                .session()
+                .rd_session
+                .notify_pointer_axis(dx, dy, 0)
+                .await?;
             Ok(Response::Ok)
         }
 
         Request::KeyEvent { keycode, pressed } => {
-            let s = ensure_session(session, connector).await?;
-            s.rd_session
+            let display = display
+                .ok_or_else(|| anyhow::anyhow!("display provider not available"))?;
+            let guard = display.lock().await;
+            guard
+                .session()
+                .rd_session
                 .notify_keyboard_keycode(keycode, pressed)
                 .await?;
             Ok(Response::Ok)
         }
 
         Request::TypeText { text } => {
-            let s = ensure_session(session, connector).await?;
+            let display = display
+                .ok_or_else(|| anyhow::anyhow!("display provider not available"))?;
+            let guard = display.lock().await;
+            let s = guard.session();
             const KEY_LEFTSHIFT: u32 = 42;
             for c in text.chars() {
                 if let Some((code, needs_shift)) = common::keymap::ascii_to_evdev(c) {
