@@ -46,6 +46,9 @@ impl KeepaliveConsumer {
             .property("max-buffers", 4u32)
             .property("drop", true)
             .property("emit-signals", false)
+            // Keep the most recent frame even when the stream goes idle
+            // (static headless Meta-* often stops pushing).
+            .property("enable-last-sample", true)
             .build()?;
         let caps = gst::Caps::builder("video/x-raw")
             .field("format", "RGBA")
@@ -115,13 +118,30 @@ impl KeepaliveConsumer {
     }
 
     pub fn capture_png(&self) -> Result<Vec<u8>> {
-        // Drain stale buffers, then wait for a fresh one.
-        while self.appsink.try_pull_sample(gst::ClockTime::ZERO).is_some() {}
-        let sample = self
-            .appsink
-            .try_pull_sample(gst::ClockTime::from_seconds(5))
-            .ok_or_else(|| anyhow!("no frame from keepalive appsink within 5s"))?;
-        sample_to_png(&sample)
+        // Drain the queue, but keep the newest drained sample. Virtual /
+        // damage-driven ScreenCast streams often stop pushing when the
+        // desktop is static — waiting only for a *new* frame then times out.
+        let mut newest = None;
+        while let Some(s) = self.appsink.try_pull_sample(gst::ClockTime::ZERO) {
+            newest = Some(s);
+        }
+        if let Some(sample) = newest
+            .or_else(|| {
+                self.appsink
+                    .try_pull_sample(gst::ClockTime::from_mseconds(800))
+            })
+            .or_else(|| {
+                // AppSink's retained last-sample (enable-last-sample=true).
+                self.appsink.property::<Option<gst::Sample>>("last-sample")
+            })
+            .or_else(|| {
+                self.appsink
+                    .try_pull_sample(gst::ClockTime::from_seconds(5))
+            })
+        {
+            return sample_to_png(&sample);
+        }
+        Err(anyhow!("no frame from keepalive appsink within 5s"))
     }
 }
 

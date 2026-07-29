@@ -67,7 +67,8 @@ struct Args {
 
     /// Open Mutter ScreenCast at gdrd startup (old always-on behavior).
     /// Useful on headless hosts so Meta-* exists before the first client.
-    #[arg(long, env = "GDR_EAGER_DISPLAY")]
+    /// Env: `GDR_EAGER_DISPLAY=true` / `false` (clap bool; not `1`/`0`).
+    #[arg(long, env = "GDR_EAGER_DISPLAY", default_value_t = false)]
     eager_display: bool,
 
     /// Seconds without screenshot/input before tearing down physical

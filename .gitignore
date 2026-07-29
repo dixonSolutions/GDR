@@ -19,6 +19,10 @@ screenshot.png
 !docs/**/*.png
 docs/fixtures*.png
 docs/fixtures-*/
+# Runtime gdr screenshots (keep folder, ignore PNGs)
+docs/data/captures/*
+!docs/data/captures/.gitkeep
+!docs/data/captures/README.md
 /tmp/
 .env
 .env.*

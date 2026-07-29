@@ -24,6 +24,10 @@ treat that as the **active GDR device** for the rest of the turn (and until they
 3. **See the desktop** with `gdr_screenshot` on that same `dev` when the user is
    asking you to look at, drive, or reason about what is on screen — including when
    they are mid-task and expect you to keep visual context.
+   When saving a PNG to disk for the user, write under
+   `docs/data/captures/` (e.g. `docs/data/captures/<device>-live.png` or
+   `docs/data/captures/<device>-YYYYMMDD-HHMMSS.png`). Then open/embed that path
+   so it is visible in chat or the editor.
 4. **Stay on that device** for all subsequent `gdr_*` calls until they name another.
 
 ## Manage devices
