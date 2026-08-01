@@ -85,8 +85,17 @@ cargo build --release -p gdrd
 # Full apt/dnf package (gdr + gdrd + gdr-mcp); --host enables systemd daemon
 GDR_YES=1 GDR_SUDO_PASSWORD='…' ./scripts/install.sh --host --mcp-cursor
 
-# After code changes
-./scripts/update-package.sh
+# After code changes — pick machines, optional git force-pull (clean only), Cursor
+./scripts/update.sh
+# Automation:
+./scripts/update.sh --yes
+./scripts/update.sh --yes --local-only
+./scripts/update.sh --yes --machines local,desktop
+./scripts/update.sh --yes --no-git-pull
+./scripts/update.sh user@host            # one remote
+./scripts/update.sh user@host --source
+
+# MCP-only rebuild (+ optional Cursor restart)
 ./scripts/update-mcp.sh --restart-cursor
 
 # Coding-tool MCP only (Cursor global ~/.cursor/mcp.json)
@@ -100,10 +109,10 @@ See [docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md).
 | Task | Command |
 |---|---|
 | Install system package | `./scripts/install.sh [--host] [--mcp-cursor]` |
-| Update package (code changed) | `./scripts/update-package.sh` |
+| Update (local / remotes / Cursor) | `./scripts/update.sh` · `--yes` for automation |
 | Update MCP (+ optional Cursor restart) | `./scripts/update-mcp.sh --restart-cursor` |
 | Cursor MCP setup | `./scripts/setup-mcp-cursor.sh` |
-| Update remote binary | `./scripts/update.sh user@host --source` |
+| Update one remote | `./scripts/update.sh user@host [--package\|--binary\|--source]` |
 | Status | `./scripts/status.sh user@host` |
 | Rotate token | `./scripts/rotate-token.sh user@host` |
 | Uninstall remote | `./scripts/uninstall.sh user@host` |

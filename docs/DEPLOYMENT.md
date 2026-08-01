@@ -113,11 +113,10 @@ Multi-host tokens stay in `~/.config/gdr/config.json`; tools take `host=`.
 | Script | Purpose |
 |---|---|
 | `scripts/install.sh` | Build + install system `.deb`/`.rpm` (full stack) |
-| `scripts/update-package.sh` | Rebuild from code changes + reinstall package |
-| `scripts/update-mcp.sh [--restart-cursor]` | Rebuild MCP; optional AI-host MCP restart |
+| `scripts/update.sh` | Unified updater: local package, optional remotes from `config.json`, Cursor MCP restart; or one `user@host` |
+| `scripts/update-mcp.sh [--restart-cursor]` | Rebuild MCP only; optional AI-host MCP restart |
 | `scripts/setup-mcp-cursor.sh` | Cursor global `~/.cursor/mcp.json` |
 | `scripts/install-local.sh` | User-local gdrd only (loopback + `local` profile) |
-| `scripts/update.sh user@host [--source]` | Replace remote binary, restart |
 | `scripts/status.sh user@host` | unit status, fingerprint, logs |
 | `scripts/rotate-token.sh user@host` | new GDR_TOKEN + seed |
 | `scripts/uninstall.sh user@host` | stop unit, remove binary + `~/.local/share/gdr` |
@@ -125,9 +124,31 @@ Multi-host tokens stay in `~/.config/gdr/config.json`; tools take `host=`.
 After local code changes:
 
 ```bash
-./scripts/update-package.sh              # gdr + gdrd + MCP package
-./scripts/update-mcp.sh --restart-cursor # MCP-only + kill Cursor MCP process
+./scripts/update.sh                            # interactive: machines + git pull + Cursor
+./scripts/update.sh --yes                      # all machines + git pull + Cursor
+./scripts/update.sh --yes --local-only         # this machine only
+./scripts/update.sh --yes --machines local,desktop
+./scripts/update.sh --yes --no-git-pull
+./scripts/update.sh --yes --no-restart-cursor
+./scripts/update.sh user@host                  # one remote (package / binary fallback)
+./scripts/update.sh user@host --source         # rsync + cargo build on target
+./scripts/update-mcp.sh --restart-cursor       # MCP-only rebuild
 ```
+
+Interactive select mode: type a machine number to toggle, `s` to list
+selection status, `f` to finish and continue.
+
+Git force-pull (`fetch` + `reset --hard` upstream) runs on each selected
+machine only when that checkout is clean (`git status` empty). Dirty trees
+are skipped so local work is never discarded. Remote paths tried:
+`~/SideProjects/GDR`, `~/Projects/SideProjects/GDR`, `~/gdr-src` (override
+with `GDR_SRC`).
+
+`update-package.sh` remains as a thin deprecated shim → `update.sh`.
+
+Remotes come from `~/.config/gdr/config.json` (unique `ssh` targets; localhost
+skipped). Matching distro packages install over SSH (stored `sudo_password`
+when set); mismatched remotes get a binary fallback + user-unit restart.
 
 ## Cert rotation
 

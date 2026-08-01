@@ -116,10 +116,22 @@ pub enum McpCmd {
 pub enum PkgCmd {
     Version,
     Info,
-    /// Rebuild + reinstall system package (scripts/update-package.sh).
+    /// Rebuild + reinstall system package (scripts/update.sh --yes).
     Update {
         #[arg(long)]
         skip_deps: bool,
+        /// Skip SSH remotes from config.json (local only).
+        #[arg(long)]
+        no_remotes: bool,
+        /// Comma-separated machine ids (e.g. local,desktop).
+        #[arg(long)]
+        machines: Option<String>,
+        /// Skip git force-pull on selected machines.
+        #[arg(long)]
+        no_git_pull: bool,
+        /// Skip Cursor MCP process restart.
+        #[arg(long)]
+        no_restart_cursor: bool,
     },
     Paths,
 }
@@ -608,16 +620,34 @@ pub fn run_pkg(cmd: PkgCmd) -> Result<()> {
                 }
             );
         }
-        PkgCmd::Update { skip_deps } => {
+        PkgCmd::Update {
+            skip_deps,
+            no_remotes,
+            machines,
+            no_git_pull,
+            no_restart_cursor,
+        } => {
             let root = repo_root().context("source tree not found")?;
-            let mut c = Command::new(root.join("scripts/update-package.sh"));
+            let mut c = Command::new(root.join("scripts/update.sh"));
+            c.arg("--yes");
             if skip_deps {
                 c.arg("--skip-deps");
+            }
+            if let Some(m) = machines {
+                c.arg("--machines").arg(m);
+            } else if no_remotes {
+                c.arg("--local-only");
+            }
+            if no_git_pull {
+                c.arg("--no-git-pull");
+            }
+            if no_restart_cursor {
+                c.arg("--no-restart-cursor");
             }
             std::env::set_var("GDR_YES", "1");
             let st = c.status()?;
             if !st.success() {
-                bail!("update-package.sh failed");
+                bail!("update.sh failed");
             }
         }
     }

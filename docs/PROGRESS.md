@@ -84,7 +84,7 @@ Living checklist. Update this when a milestone lands or a decision flips.
 | Same-machine | `scripts/install-local.sh` + address aliases `local`/`localhost`; Cursor MCP `~/.cursor/mcp.json` → `gdr` |
 | Physical display | Fixed `GetCurrentState` connector parse — local `gdrd` records primary monitor (e.g. DP-6), not only Meta virtual |
 | MCP input v2 | `gdr_hotkey`, `gdr_input` (chords/sequences), `gdr_double_click` / `clicks=`, `gdr_cursor` + protocol `GetCursor` |
-| Packaging | `scripts/install.sh` → apt/dnf `.deb`/`.rpm`; `update-package.sh`, `update-mcp.sh --restart-cursor`, `setup-mcp-cursor.sh` |
+| Packaging | `scripts/install.sh` → apt/dnf `.deb`/`.rpm`; `update.sh` (local+remotes+Cursor), `update-mcp.sh --restart-cursor`, `setup-mcp-cursor.sh` |
 | Devices + mgmt CLI | labels/aliases; MCP `--dev` / tool `dev=`; `gdr device|service|mcp|pkg` |
 
 Secrets (token, sudo password, cert pin) live only in

@@ -22,8 +22,13 @@ import {
   upsertDevice,
 } from "./config.js";
 import { parseServerArgv, getDefaultDevice } from "./cliArgs.js";
-import { chord, hotkey, runSequence, tapKey } from "./input.js";
+import { chord, hotkey, runSequence, tapKey, type InputStep } from "./input.js";
 import { resolveKey } from "./keys.js";
+import {
+  applyScreenshotLayout,
+  FrameStateStore,
+  type LayoutMode,
+} from "./screenshotLayout.js";
 
 parseServerArgv();
 if (getDefaultDevice()) {
@@ -31,6 +36,12 @@ if (getDefaultDevice()) {
 }
 
 const pool = new GdrClientPool();
+const frames = new FrameStateStore();
+
+function deviceKey(host?: string | null, dev?: string | null): string {
+  const resolved = resolveToolDevice({ host, dev });
+  return resolved.name ?? `__env__:${resolved.address}:${resolved.port}`;
+}
 
 function clientFor(host?: string | null, dev?: string | null) {
   const resolved = resolveToolDevice({ host, dev });
@@ -43,6 +54,68 @@ function clientFor(host?: string | null, dev?: string | null) {
   });
 }
 
+/** Remap image-space coords using the last screenshot for this device. */
+function mapPointer(host: string | undefined, dev: string | undefined, x: number, y: number) {
+  const key = deviceKey(host, dev);
+  const { stream_x, stream_y, click_space } = frames.toStream(key, x, y);
+  return { key, x, y, stream_x, stream_y, click_space };
+}
+
+function remapInputSteps(
+  host: string | undefined,
+  dev: string | undefined,
+  steps: InputStep[]
+): InputStep[] {
+  const key = deviceKey(host, dev);
+  return steps.map((step) => {
+    if ("move" in step) {
+      const { stream_x, stream_y } = frames.toStream(key, step.move.x, step.move.y);
+      return { move: { x: stream_x, y: stream_y } };
+    }
+    if ("click" in step) {
+      const { stream_x, stream_y } = frames.toStream(key, step.click.x, step.click.y);
+      return {
+        click: {
+          ...step.click,
+          x: stream_x,
+          y: stream_y,
+        },
+      };
+    }
+    return step;
+  });
+}
+
+async function screenshotResult(
+  host: string | undefined,
+  dev: string | undefined,
+  layout: LayoutMode
+) {
+  const key = deviceKey(host, dev);
+  const client = clientFor(host, dev);
+  const resp = await client.request({ type: "Screenshot", connector: null });
+  if (resp.type !== "Screenshot") return textResult(resp, true);
+  const applied = await applyScreenshotLayout(resp.png_base64, layout);
+  frames.set(key, {
+    native_width: applied.meta.native_width,
+    native_height: applied.meta.native_height,
+    image_width: applied.meta.image_width,
+    image_height: applied.meta.image_height,
+    layout: applied.meta.layout,
+    click_space: applied.meta.click_space,
+  });
+  return {
+    content: [
+      { type: "text" as const, text: JSON.stringify(applied.meta) },
+      {
+        type: "image" as const,
+        data: applied.png_base64,
+        mimeType: "image/png" as const,
+      },
+    ],
+  };
+}
+
 function btn(button?: "left" | "right" | "middle") {
   return button === "right" ? BTN_RIGHT : button === "middle" ? BTN_MIDDLE : BTN_LEFT;
 }
@@ -53,6 +126,18 @@ function textResult(payload: unknown, isError = false) {
     isError,
   };
 }
+
+function mapError(e: unknown) {
+  return textResult({ error: e instanceof Error ? e.message : String(e) }, true);
+}
+
+const layoutProp = z
+  .enum(["raw", "agent"])
+  .default("agent")
+  .describe(
+    'Screenshot post-process: "agent" (default) downscales to fit 1440×900 and ' +
+      'returns geometry text; clicks use image pixel space. "raw" keeps native PNG 1:1.'
+  );
 
 const hostProp = z
   .string()
@@ -108,39 +193,30 @@ const server = new McpServer({ name: "gdr", version: "0.3.0" });
 
 server.tool(
   "gdr_screenshot",
-  "Take a screenshot of the remote GNOME/Wayland desktop and return it as an image.",
-  { ...deviceArgs },
-  async ({ host, dev }) => {
-    const client = clientFor(host, dev);
-    const resp = await client.request({ type: "Screenshot", connector: null });
-    if (resp.type !== "Screenshot") return textResult(resp, true);
-    return {
-      content: [{ type: "image", data: resp.png_base64, mimeType: "image/png" }],
-    };
-  }
+  "Take a screenshot of the remote GNOME/Wayland desktop. Returns geometry JSON " +
+    "(native/image size, click_space) then a PNG. Default layout=agent fits the " +
+    "image inside 1440×900; pass x,y to gdr_click/gdr_move in that image pixel space.",
+  { ...deviceArgs, layout: layoutProp },
+  async ({ host, dev, layout }) => screenshotResult(host, dev, layout)
 );
 
 server.tool(
   "gnome_screenshot",
   "Alias for gdr_screenshot.",
-  { ...deviceArgs },
-  async ({ host, dev }) => {
-    const client = clientFor(host, dev);
-    const resp = await client.request({ type: "Screenshot", connector: null });
-    if (resp.type !== "Screenshot") return textResult(resp, true);
-    return {
-      content: [{ type: "image", data: resp.png_base64, mimeType: "image/png" }],
-    };
-  }
+  { ...deviceArgs, layout: layoutProp },
+  async ({ host, dev, layout }) => screenshotResult(host, dev, layout)
 );
 
 server.tool(
   "gdr_click",
-  "Move the mouse to (x, y) and click. Set clicks=2 for double-click.",
+  "Move the mouse to (x, y) and click. Coordinates are in the pixel space of the " +
+    "most recent gdr_screenshot for this device (image space when layout=agent " +
+    "downscaled; native when layout=raw). Requires a prior gdr_screenshot. " +
+    "Set clicks=2 for double-click.",
   {
     ...deviceArgs,
-    x: z.number().describe("X coordinate in pixels"),
-    y: z.number().describe("Y coordinate in pixels"),
+    x: z.number().describe("X in latest screenshot image pixels"),
+    y: z.number().describe("Y in latest screenshot image pixels"),
     button: z.enum(["left", "right", "middle"]).default("left"),
     clicks: z
       .number()
@@ -151,9 +227,28 @@ server.tool(
       .describe("1 = single click, 2 = double-click, etc."),
   },
   async ({ host, dev, x, y, button, clicks }) => {
-    const client = clientFor(host, dev);
-    const resp = await client.multiClick(x, y, btn(button), clicks);
-    return textResult({ ...resp, x, y, button, clicks });
+    try {
+      const mapped = mapPointer(host, dev, x, y);
+      const client = clientFor(host, dev);
+      const resp = await client.multiClick(
+        mapped.stream_x,
+        mapped.stream_y,
+        btn(button),
+        clicks
+      );
+      return textResult({
+        ...resp,
+        x,
+        y,
+        stream_x: mapped.stream_x,
+        stream_y: mapped.stream_y,
+        click_space: mapped.click_space,
+        button,
+        clicks,
+      });
+    } catch (e) {
+      return mapError(e);
+    }
   }
 );
 
@@ -168,15 +263,34 @@ server.tool(
     clicks: z.number().int().min(1).max(10).default(1),
   },
   async ({ host, dev, x, y, button, clicks }) => {
-    const client = clientFor(host, dev);
-    const resp = await client.multiClick(x, y, btn(button), clicks);
-    return textResult({ ...resp, x, y, button, clicks });
+    try {
+      const mapped = mapPointer(host, dev, x, y);
+      const client = clientFor(host, dev);
+      const resp = await client.multiClick(
+        mapped.stream_x,
+        mapped.stream_y,
+        btn(button),
+        clicks
+      );
+      return textResult({
+        ...resp,
+        x,
+        y,
+        stream_x: mapped.stream_x,
+        stream_y: mapped.stream_y,
+        click_space: mapped.click_space,
+        button,
+        clicks,
+      });
+    } catch (e) {
+      return mapError(e);
+    }
   }
 );
 
 server.tool(
   "gdr_double_click",
-  "Double-click at (x, y).",
+  "Double-click at (x, y) in the latest screenshot image pixel space.",
   {
     ...deviceArgs,
     x: z.number(),
@@ -184,20 +298,51 @@ server.tool(
     button: z.enum(["left", "right", "middle"]).default("left"),
   },
   async ({ host, dev, x, y, button }) => {
-    const client = clientFor(host, dev);
-    const resp = await client.multiClick(x, y, btn(button), 2);
-    return textResult({ ...resp, x, y, button, clicks: 2 });
+    try {
+      const mapped = mapPointer(host, dev, x, y);
+      const client = clientFor(host, dev);
+      const resp = await client.multiClick(mapped.stream_x, mapped.stream_y, btn(button), 2);
+      return textResult({
+        ...resp,
+        x,
+        y,
+        stream_x: mapped.stream_x,
+        stream_y: mapped.stream_y,
+        click_space: mapped.click_space,
+        button,
+        clicks: 2,
+      });
+    } catch (e) {
+      return mapError(e);
+    }
   }
 );
 
 server.tool(
   "gdr_move",
-  "Move the mouse to (x, y) without clicking. Updates the tracked cursor position.",
+  "Move the mouse to (x, y) without clicking. Coordinates use the latest " +
+    "screenshot image pixel space (same as gdr_click). Updates tracked cursor.",
   { ...deviceArgs, x: z.number(), y: z.number() },
   async ({ host, dev, x, y }) => {
-    const client = clientFor(host, dev);
-    const resp = await client.request({ type: "MouseMove", x, y });
-    return textResult({ ...resp, x, y });
+    try {
+      const mapped = mapPointer(host, dev, x, y);
+      const client = clientFor(host, dev);
+      const resp = await client.request({
+        type: "MouseMove",
+        x: mapped.stream_x,
+        y: mapped.stream_y,
+      });
+      return textResult({
+        ...resp,
+        x,
+        y,
+        stream_x: mapped.stream_x,
+        stream_y: mapped.stream_y,
+        click_space: mapped.click_space,
+      });
+    } catch (e) {
+      return mapError(e);
+    }
   }
 );
 
@@ -206,9 +351,25 @@ server.tool(
   "Alias for gdr_move.",
   { ...deviceArgs, x: z.number(), y: z.number() },
   async ({ host, dev, x, y }) => {
-    const client = clientFor(host, dev);
-    const resp = await client.request({ type: "MouseMove", x, y });
-    return textResult({ ...resp, x, y });
+    try {
+      const mapped = mapPointer(host, dev, x, y);
+      const client = clientFor(host, dev);
+      const resp = await client.request({
+        type: "MouseMove",
+        x: mapped.stream_x,
+        y: mapped.stream_y,
+      });
+      return textResult({
+        ...resp,
+        x,
+        y,
+        stream_x: mapped.stream_x,
+        stream_y: mapped.stream_y,
+        click_space: mapped.click_space,
+      });
+    } catch (e) {
+      return mapError(e);
+    }
   }
 );
 
@@ -302,6 +463,7 @@ server.tool(
   "gdr_input",
   "Run a flexible ordered sequence of keyboard/mouse steps on one connection. " +
     "Supports tap/down/up, chords, hotkey strings, type, delay_ms, move, and click (with clicks for double-click). " +
+    "move/click x,y use the latest screenshot image pixel space (same as gdr_click). " +
     'Example: [{hotkey:"Super+PageDown"},{delay_ms:500},{hotkey:"Super"},{type:"lutris"},{tap:"Enter"}]',
   {
     ...deviceArgs,
@@ -310,10 +472,10 @@ server.tool(
   async ({ host, dev, steps }) => {
     const client = clientFor(host, dev);
     try {
-      const result = await runSequence(client, steps);
+      const result = await runSequence(client, remapInputSteps(host, dev, steps));
       return textResult(result);
     } catch (e) {
-      return textResult({ error: e instanceof Error ? e.message : String(e) }, true);
+      return mapError(e);
     }
   }
 );

@@ -82,6 +82,6 @@ echo "  gdrd     → $(command -v gdrd || echo /usr/bin/gdrd)"
 echo "  gdr-mcp  → $(command -v gdr-mcp || echo /usr/bin/gdr-mcp)"
 echo
 echo "Day-2:"
-echo "  ./scripts/update-package.sh     # rebuild + reinstall after code changes"
+echo "  ./scripts/update.sh             # rebuild + reinstall (+ remotes / Cursor)"
 echo "  ./scripts/update-mcp.sh         # rebuild MCP only (+ optional Cursor restart)"
 echo "  ./scripts/setup-mcp-cursor.sh   # Cursor global MCP wiring"

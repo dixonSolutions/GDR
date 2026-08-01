@@ -81,10 +81,10 @@ Claude Desktop’s config when found.
 
 | Tool | Args | Notes |
 |---|---|---|
-| `gdr_screenshot` / `gnome_screenshot` | `host?` | Returns image content |
-| `gdr_click` / `gnome_click` | `host?`, `x`, `y`, `button?`, `clicks?` | `clicks=2` = double-click |
+| `gdr_screenshot` / `gnome_screenshot` | `host?`, `layout?` | Default `layout=agent` downscales to ≤1440×900 and returns geometry JSON + PNG; `raw` is 1:1 native |
+| `gdr_click` / `gnome_click` | `host?`, `x`, `y`, `button?`, `clicks?` | `x,y` in latest screenshot image space; remapped to stream pixels. Requires a prior screenshot. `clicks=2` = double-click |
 | `gdr_double_click` | `host?`, `x`, `y`, `button?` | shorthand |
-| `gdr_move` / `gnome_move` | `host?`, `x`, `y` | updates tracked cursor |
+| `gdr_move` / `gnome_move` | `host?`, `x`, `y` | same image-space remap as click; updates tracked cursor |
 | `gdr_cursor` | `host?` | last known `{x,y,known}` from gdr moves |
 | `gdr_key` / `gnome_key` | `host?`, `key`/`keycode`, `modifiers?` | names or evdev; mods held for tap |
 | `gdr_hotkey` | `host?`, `keys` | `"Alt+F4"`, `"Super+PageDown"` |
@@ -137,6 +137,19 @@ via tool args are rejected by design.
 
 Connections are pooled per profile and serialized (one in-flight request
 per client) so screenshot→click loops stay on one Mutter session.
+
+### Screenshot layout → click remap
+
+MCP keeps per-device frame geometry from the last `gdr_screenshot`. Click/move
+coords are mapped from image pixels back to Mutter stream pixels (clamped to
+`[0, native-1]`). Calling `gdr_click` / `gdr_move` before any screenshot for
+that device errors loudly (`no screenshot geometry…`) instead of silently
+treating coords as native.
+
+Geometry is only replaced on the next screenshot — re-screenshot after
+resize, workspace switch, or monitor change. Native PNG size must match the
+PipeWire buffer for the ScreenCast stream node (true by construction in
+gdrd today: same keepalive appsink).
 
 ## `gdr_get_password` — intentional tradeoff
 

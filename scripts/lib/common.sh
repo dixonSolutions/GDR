@@ -128,7 +128,9 @@ build_deb() {
   local stage arch deb
   arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
   stage="$(mktemp -d /tmp/gdr-deb.XXXXXX)"
-  trap 'rm -rf "$stage"' RETURN
+  # Expand path now — under `set -u`, locals are gone before RETURN traps run.
+  # shellcheck disable=SC2064
+  trap "rm -rf $(printf '%q' "$stage")" RETURN
 
   stage_package_tree "$stage"
   mkdir -p "$stage/DEBIAN"
@@ -169,7 +171,9 @@ build_rpm() {
   stage="$(mktemp -d /tmp/gdr-rpm.XXXXXX)"
   top="$stage/rpmbuild"
   mkdir -p "$top"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
-  trap 'rm -rf "$stage"' RETURN
+  # Expand path now — under `set -u`, locals are gone before RETURN traps run.
+  # shellcheck disable=SC2064
+  trap "rm -rf $(printf '%q' "$stage")" RETURN
 
   local rootfs="$stage/root"
   stage_package_tree "$rootfs"
@@ -238,17 +242,25 @@ install_package_file() {
   esac
 }
 
-build_and_install_package() {
-  local pm pkg
+# Build the distro package and print its path (does not install).
+build_package_file() {
+  local pm
   pm="$(detect_pkg_manager)"
   case "$pm" in
-    apt) pkg="$(build_deb)" ;;
-    dnf) pkg="$(build_rpm)" ;;
+    apt) build_deb ;;
+    dnf) build_rpm ;;
     *) die "need apt or dnf" ;;
   esac
+}
+
+build_and_install_package() {
+  local pkg
+  pkg="$(build_package_file)"
   echo "==> Installing $pkg"
   install_package_file "$pkg"
   echo "Installed system package: $pkg"
+  # Callers (update.sh) may reuse this path for remotes.
+  LAST_PACKAGE_FILE="$pkg"
 }
 
 setup_host_daemon() {
@@ -368,4 +380,350 @@ restart_cursor_mcp() {
   pkill -f "$ROOT/mcp-server/dist/index.js" 2>/dev/null || true
   sleep 0.3
   echo "Done. Reload MCP in Cursor if tools look stale (Command Palette → MCP: Restart / Reload Window)."
+}
+
+controller_config_path() {
+  echo "${XDG_CONFIG_HOME:-$HOME/.config}/gdr/config.json"
+}
+
+# Unique remote SSH targets from ~/.config/gdr/config.json (skips localhost).
+# Prints TSV lines: id<TAB>ssh<TAB>sudo_password (password may be empty).
+# Dedupes by ssh target (first profile wins for sudo).
+list_remote_ssh_targets() {
+  local cfg
+  cfg="$(controller_config_path)"
+  [ -f "$cfg" ] || return 0
+  node -e '
+    const fs = require("fs");
+    const cfgPath = process.argv[1];
+    let cfg;
+    try { cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8")); }
+    catch (_) { process.exit(0); }
+    const hosts = cfg.hosts || {};
+    const seen = new Set();
+    const localAddr = new Set(["localhost", "127.0.0.1", "::1", ".", "local"]);
+    for (const [id, h] of Object.entries(hosts)) {
+      if (!h || typeof h !== "object") continue;
+      const ssh = (h.ssh || "").trim();
+      if (!ssh) continue;
+      const addr = String(h.address || "").trim().toLowerCase();
+      if (localAddr.has(addr)) continue;
+      if (seen.has(ssh)) continue;
+      seen.add(ssh);
+      const sudo = h.sudo_password == null ? "" : String(h.sudo_password);
+      process.stdout.write(`${id}\t${ssh}\t${sudo}\n`);
+    }
+  ' "$cfg"
+}
+
+ssh_remote() {
+  local target="$1"; shift
+  ssh -o BatchMode=yes -o ConnectTimeout=15 "$target" "$@"
+}
+
+# Run a remote command with sudo -S. Password via arg (not echoed); not argv on remote.
+ssh_remote_sudo() {
+  local target="$1" pass="$2"; shift 2
+  local cmd="$*"
+  if [ -n "$pass" ]; then
+    # shellcheck disable=SC2029
+    printf '%s\n' "$pass" | ssh -o BatchMode=yes -o ConnectTimeout=15 "$target" \
+      "sudo -S -p '' bash -lc $(printf '%q' "$cmd")"
+  else
+    # Passwordless sudo, or fail clearly.
+    # shellcheck disable=SC2029
+    ssh -o BatchMode=yes -o ConnectTimeout=15 "$target" \
+      "sudo -n bash -lc $(printf '%q' "$cmd")"
+  fi
+}
+
+# Push release binaries when package type does not match the remote distro.
+push_remote_binaries() {
+  local target="$1" pass="$2"
+  local gdrd="$ROOT/target/release/gdrd"
+  local gdrbin="$ROOT/target/release/gdr"
+  [ -x "$gdrd" ] || die "missing $gdrd"
+  echo "    pushing binaries to $target..."
+  ssh_remote "$target" 'mkdir -p /tmp/gdr-bin-update'
+  scp -o BatchMode=yes -o ConnectTimeout=15 \
+    "$gdrd" "$gdrbin" "$ROOT/packaging/gdr-mcp.sh" \
+    "$target:/tmp/gdr-bin-update/"
+  if ssh_remote "$target" 'test -x /usr/bin/gdrd || test -d /usr/share/gdr'; then
+    ssh_remote_sudo "$target" "$pass" \
+      'install -m 755 /tmp/gdr-bin-update/gdrd /usr/bin/gdrd;
+       install -m 755 /tmp/gdr-bin-update/gdr /usr/bin/gdr;
+       install -m 755 /tmp/gdr-bin-update/gdr-mcp.sh /usr/bin/gdr-mcp;
+       rm -rf /tmp/gdr-bin-update'
+  else
+    ssh_remote "$target" \
+      'mkdir -p "$HOME/.local/bin";
+       install -m 755 /tmp/gdr-bin-update/gdrd "$HOME/.local/bin/gdrd";
+       install -m 755 /tmp/gdr-bin-update/gdr "$HOME/.local/bin/gdr" 2>/dev/null || true;
+       rm -rf /tmp/gdr-bin-update'
+  fi
+}
+
+install_remote_package_file() {
+  local target="$1" pass="$2" pkg="$3"
+  local base remote_pm remote_pkg
+  base="$(basename "$pkg")"
+  remote_pkg="/tmp/$base"
+
+  remote_pm="$(ssh_remote "$target" \
+    'if command -v apt-get >/dev/null 2>&1; then echo apt;
+     elif command -v dnf >/dev/null 2>&1; then echo dnf;
+     else echo unknown; fi')" || return 1
+
+  case "$pkg" in
+    *.deb)
+      if [ "$remote_pm" != apt ]; then
+        echo "    warn: $target is $remote_pm but package is .deb — binary fallback"
+        push_remote_binaries "$target" "$pass"
+        return 0
+      fi
+      echo "    installing $base via apt..."
+      scp -o BatchMode=yes -o ConnectTimeout=15 "$pkg" "$target:$remote_pkg"
+      ssh_remote_sudo "$target" "$pass" \
+        "dpkg -i $(printf '%q' "$remote_pkg") || apt-get install -f -y; rm -f $(printf '%q' "$remote_pkg")"
+      ;;
+    *.rpm)
+      if [ "$remote_pm" != dnf ]; then
+        echo "    warn: $target is $remote_pm but package is .rpm — binary fallback"
+        push_remote_binaries "$target" "$pass"
+        return 0
+      fi
+      echo "    installing $base via dnf..."
+      scp -o BatchMode=yes -o ConnectTimeout=15 "$pkg" "$target:$remote_pkg"
+      ssh_remote_sudo "$target" "$pass" \
+        "dnf install -y $(printf '%q' "$remote_pkg"); rm -f $(printf '%q' "$remote_pkg")"
+      ;;
+    *)
+      die "unknown package type for remote: $pkg"
+      ;;
+  esac
+}
+
+restart_remote_gdrd() {
+  local target="$1"
+  # User unit — no sudo. Linger hosts keep the session bus available over SSH.
+  if ssh_remote "$target" \
+    'systemctl --user restart gdr.service 2>/dev/null || systemctl --user restart gdrd.service 2>/dev/null'; then
+    ssh_remote "$target" \
+      'systemctl --user --no-pager is-active gdr.service 2>/dev/null \
+       || systemctl --user --no-pager is-active gdrd.service 2>/dev/null \
+       || true' || true
+    return 0
+  fi
+  echo "    warn: could not restart gdr user service on $target" >&2
+  return 1
+}
+
+# Install/update package on SSH remotes, then restart gdrd.
+# Usage:
+#   update_remote_packages "$pkg"                  # all remotes from config
+#   update_remote_packages "$pkg" --only id1 id2   # filter by device id
+#   update_remote_packages "$pkg" --ssh user@host  # filter by ssh target(s)
+update_remote_packages() {
+  local pkg="$1"
+  shift || true
+  local mode="all"
+  local -a filter=()
+  local id target pass count=0 fail=0 want
+
+  [ -n "$pkg" ] && [ -f "$pkg" ] || die "update_remote_packages: missing package file"
+
+  if [ "${1:-}" = "--only" ]; then
+    mode="id"
+    shift
+    filter=("$@")
+  elif [ "${1:-}" = "--ssh" ]; then
+    mode="ssh"
+    shift
+    filter=("$@")
+  elif [ $# -gt 0 ]; then
+    die "update_remote_packages: unexpected args (use --only / --ssh)"
+  fi
+
+  if [ ! -f "$(controller_config_path)" ]; then
+    echo "==> No $(controller_config_path) — skipping remotes"
+    return 0
+  fi
+
+  echo "==> Updating remotes from $(controller_config_path)..."
+  while IFS=$'\t' read -r id target pass; do
+    [ -n "$target" ] || continue
+    if [ "$mode" = "id" ]; then
+      want=0
+      for f in "${filter[@]}"; do
+        [ "$f" = "$id" ] && want=1 && break
+      done
+      [ "$want" = 1 ] || continue
+    elif [ "$mode" = "ssh" ]; then
+      want=0
+      for f in "${filter[@]}"; do
+        [ "$f" = "$target" ] && want=1 && break
+      done
+      [ "$want" = 1 ] || continue
+    fi
+    count=$((count + 1))
+    echo "==> Remote #$count: $id ($target)"
+    if ! install_remote_package_file "$target" "$pass" "$pkg"; then
+      echo "    error: package update failed for $id" >&2
+      fail=$((fail + 1))
+      continue
+    fi
+    if ! restart_remote_gdrd "$target"; then
+      fail=$((fail + 1))
+      continue
+    fi
+    echo "    ok: $id package + gdrd restart"
+  done < <(list_remote_ssh_targets)
+
+  if [ "$count" -eq 0 ]; then
+    echo "    (no matching SSH remotes)"
+  else
+    echo "==> Remotes done: $count updated, $fail failed"
+  fi
+  [ "$fail" -eq 0 ]
+}
+
+# Back-compat name.
+update_all_remote_packages() {
+  update_remote_packages "$@"
+}
+
+# Candidate source trees on a machine (first existing .git wins).
+# Override with GDR_SRC=/path on local or remote.
+gdr_src_candidates() {
+  if [ -n "${GDR_SRC:-}" ]; then
+    printf '%s\n' "$GDR_SRC"
+  fi
+  printf '%s\n' \
+    "$ROOT" \
+    "$HOME/SideProjects/GDR" \
+    "$HOME/Projects/SideProjects/GDR" \
+    "$HOME/gdr-src" \
+    "$HOME/GDR"
+}
+
+# Resolve first git checkout of GDR on this machine. Empty if none.
+find_gdr_git_dir() {
+  local d
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    if [ -d "$d/.git" ] || git -C "$d" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      printf '%s\n' "$d"
+      return 0
+    fi
+  done < <(gdr_src_candidates)
+  return 1
+}
+
+# True if worktree has no staged/unstaged/untracked changes.
+git_worktree_clean() {
+  local dir="$1"
+  [ -z "$(git -C "$dir" status --porcelain 2>/dev/null)" ]
+}
+
+# Force-align to upstream: fetch + reset --hard. Skips if dirty or no upstream.
+# Prints what it did. Returns 0 on success/skip, 1 on hard failure.
+git_force_pull_if_clean() {
+  local dir="$1" label="${2:-$dir}"
+  local branch upstream
+
+  if [ ! -d "$dir" ]; then
+    echo "    skip $label: no source dir ($dir)"
+    return 0
+  fi
+  if ! git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "    skip $label: not a git repo ($dir)"
+    return 0
+  fi
+  if ! git_worktree_clean "$dir"; then
+    echo "    skip $label: local changes present — not force-pulling ($dir)"
+    git -C "$dir" status -sb 2>/dev/null | head -5 | sed 's/^/      /' || true
+    return 0
+  fi
+
+  branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+  echo "    git fetch — $label ($dir @ $branch)"
+  if ! git -C "$dir" fetch --prune --tags origin 2>&1 | sed 's/^/      /'; then
+    # Some remotes use a non-origin name; try plain fetch.
+    git -C "$dir" fetch --prune --tags 2>&1 | sed 's/^/      /' || {
+      echo "    error: git fetch failed on $label" >&2
+      return 1
+    }
+  fi
+
+  if upstream="$(git -C "$dir" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null)"; then
+    :
+  elif git -C "$dir" rev-parse --verify "origin/$branch" >/dev/null 2>&1; then
+    upstream="origin/$branch"
+  else
+    echo "    skip $label: no upstream tracking branch"
+    return 0
+  fi
+
+  echo "    git reset --hard $upstream — $label"
+  git -C "$dir" reset --hard "$upstream" 2>&1 | sed 's/^/      /' || {
+    echo "    error: git reset --hard failed on $label" >&2
+    return 1
+  }
+  git -C "$dir" log -1 --oneline 2>/dev/null | sed 's/^/      HEAD /' || true
+  return 0
+}
+
+# Force-pull on a remote host if its GDR checkout is clean.
+# Searches the same candidate paths as local (via SSH).
+remote_git_force_pull_if_clean() {
+  local target="$1" label="${2:-$target}"
+  local script
+
+  script=$(
+    cat <<'EOS'
+set -euo pipefail
+cands=()
+[ -n "${GDR_SRC:-}" ] && cands+=("$GDR_SRC")
+cands+=("$HOME/SideProjects/GDR" "$HOME/Projects/SideProjects/GDR" "$HOME/gdr-src" "$HOME/GDR")
+dir=""
+for d in "${cands[@]}"; do
+  if [ -d "$d/.git" ] || git -C "$d" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    dir="$d"
+    break
+  fi
+done
+if [ -z "$dir" ]; then
+  echo "skip: no GDR git checkout found"
+  exit 0
+fi
+if [ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]; then
+  echo "skip: local changes present — not force-pulling ($dir)"
+  git -C "$dir" status -sb | head -5
+  exit 0
+fi
+branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+echo "fetch $dir @ $branch"
+git -C "$dir" fetch --prune --tags origin 2>/dev/null \
+  || git -C "$dir" fetch --prune --tags
+if upstream="$(git -C "$dir" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null)"; then
+  :
+elif git -C "$dir" rev-parse --verify "origin/$branch" >/dev/null 2>&1; then
+  upstream="origin/$branch"
+else
+  echo "skip: no upstream for $branch"
+  exit 0
+fi
+echo "reset --hard $upstream"
+git -C "$dir" reset --hard "$upstream"
+git -C "$dir" log -1 --oneline
+EOS
+  )
+
+  echo "    git pull — $label ($target)"
+  # shellcheck disable=SC2029
+  if ! ssh -o BatchMode=yes -o ConnectTimeout=15 "$target" "bash -s" <<<"$script" 2>&1 | sed 's/^/      /'; then
+    echo "    error: remote git pull failed on $label" >&2
+    return 1
+  fi
+  return 0
 }
