@@ -138,11 +138,11 @@ After local code changes:
 Interactive select mode: type a machine number to toggle, `s` to list
 selection status, `f` to finish and continue.
 
-Git force-pull (`fetch` + `reset --hard` upstream) runs on each selected
-machine only when that checkout is clean (`git status` empty). Dirty trees
-are skipped so local work is never discarded. Remote paths tried:
-`~/SideProjects/GDR`, `~/Projects/SideProjects/GDR`, `~/gdr-src` (override
-with `GDR_SRC`).
+Git sync (`fetch`, then `reset --hard` upstream **only when behind**) runs on
+each selected machine when the worktree is clean. Skipped when there are
+uncommitted changes, unpushed commits (ahead), or a diverged history — so
+local work is never discarded. Remote paths tried: `~/SideProjects/GDR`,
+`~/Projects/SideProjects/GDR`, `~/gdr-src` (override with `GDR_SRC`).
 
 `update-package.sh` remains as a thin deprecated shim → `update.sh`.
 

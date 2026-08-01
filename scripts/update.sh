@@ -520,6 +520,7 @@ fi
 
 mapfile -t REMOTE_IDS < <(selected_remote_ids)
 if [ "${#REMOTE_IDS[@]}" -gt 0 ]; then
+  echo "==> Selected remotes: $(IFS=,; echo "${REMOTE_IDS[*]}")"
   if ! update_remote_packages "$pkg" --only "${REMOTE_IDS[@]}"; then
     remote_ok=0
     echo "warning: one or more remotes failed — see above" >&2

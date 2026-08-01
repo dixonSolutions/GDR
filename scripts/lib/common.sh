@@ -465,14 +465,29 @@ push_remote_binaries() {
 
 install_remote_package_file() {
   local target="$1" pass="$2" pkg="$3"
-  local base remote_pm remote_pkg
+  local base remote_pm remote_pkg ssh_err
   base="$(basename "$pkg")"
   remote_pkg="/tmp/$base"
 
+  set +e
   remote_pm="$(ssh_remote "$target" \
     'if command -v apt-get >/dev/null 2>&1; then echo apt;
      elif command -v dnf >/dev/null 2>&1; then echo dnf;
-     else echo unknown; fi')" || return 1
+     else echo unknown; fi' 2>/tmp/gdr-ssh-err.$$)"
+  local ssh_ec=$?
+  set -e
+  if [ "$ssh_ec" -ne 0 ]; then
+    ssh_err="$(cat /tmp/gdr-ssh-err.$$ 2>/dev/null || true)"
+    rm -f /tmp/gdr-ssh-err.$$
+    if printf '%s' "$ssh_err" | grep -qiE 'Permission denied|Could not resolve|Connection (timed out|refused)'; then
+      echo "    skip: SSH unreachable ($target) — fix keys/host and retry" >&2
+      echo "      $ssh_err" | head -2 >&2
+      return 2
+    fi
+    echo "    error: ssh failed ($target): $ssh_err" >&2
+    return 1
+  fi
+  rm -f /tmp/gdr-ssh-err.$$
 
   case "$pkg" in
     *.deb)
@@ -528,7 +543,7 @@ update_remote_packages() {
   shift || true
   local mode="all"
   local -a filter=()
-  local id target pass count=0 fail=0 want
+  local id target pass count=0 fail=0 want inst_ec
 
   [ -n "$pkg" ] && [ -f "$pkg" ] || die "update_remote_packages: missing package file"
 
@@ -567,7 +582,15 @@ update_remote_packages() {
     fi
     count=$((count + 1))
     echo "==> Remote #$count: $id ($target)"
-    if ! install_remote_package_file "$target" "$pass" "$pkg"; then
+    set +e
+    install_remote_package_file "$target" "$pass" "$pkg"
+    inst_ec=$?
+    set -e
+    if [ "$inst_ec" -eq 2 ]; then
+      # SSH unreachable — counted as skip, not hard fail
+      continue
+    fi
+    if [ "$inst_ec" -ne 0 ]; then
       echo "    error: package update failed for $id" >&2
       fail=$((fail + 1))
       continue
@@ -582,7 +605,7 @@ update_remote_packages() {
   if [ "$count" -eq 0 ]; then
     echo "    (no matching SSH remotes)"
   else
-    echo "==> Remotes done: $count updated, $fail failed"
+    echo "==> Remotes done: $count attempted, $fail failed"
   fi
   [ "$fail" -eq 0 ]
 }
@@ -625,11 +648,15 @@ git_worktree_clean() {
   [ -z "$(git -C "$dir" status --porcelain 2>/dev/null)" ]
 }
 
-# Force-align to upstream: fetch + reset --hard. Skips if dirty or no upstream.
-# Prints what it did. Returns 0 on success/skip, 1 on hard failure.
+# Sync to upstream with fetch + reset --hard, but never destroy work:
+#   - dirty worktree (uncommitted) → skip
+#   - ahead of upstream (unpushed commits) → skip
+#   - diverged → skip
+#   - behind only → reset --hard upstream
+# Returns 0 on success/skip, 1 on hard failure.
 git_force_pull_if_clean() {
   local dir="$1" label="${2:-$dir}"
-  local branch upstream
+  local branch upstream ahead behind
 
   if [ ! -d "$dir" ]; then
     echo "    skip $label: no source dir ($dir)"
@@ -640,16 +667,15 @@ git_force_pull_if_clean() {
     return 0
   fi
   if ! git_worktree_clean "$dir"; then
-    echo "    skip $label: local changes present — not force-pulling ($dir)"
+    echo "    skip $label: uncommitted changes — not force-pulling ($dir)"
     git -C "$dir" status -sb 2>/dev/null | head -5 | sed 's/^/      /' || true
     return 0
   fi
 
   branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
   echo "    git fetch — $label ($dir @ $branch)"
-  if ! git -C "$dir" fetch --prune --tags origin 2>&1 | sed 's/^/      /'; then
-    # Some remotes use a non-origin name; try plain fetch.
-    git -C "$dir" fetch --prune --tags 2>&1 | sed 's/^/      /' || {
+  if ! git -C "$dir" fetch --prune --tags origin >/dev/null 2>&1; then
+    git -C "$dir" fetch --prune --tags >/dev/null 2>&1 || {
       echo "    error: git fetch failed on $label" >&2
       return 1
     }
@@ -664,7 +690,24 @@ git_force_pull_if_clean() {
     return 0
   fi
 
-  echo "    git reset --hard $upstream — $label"
+  ahead="$(git -C "$dir" rev-list --count "$upstream"..HEAD 2>/dev/null || echo 0)"
+  behind="$(git -C "$dir" rev-list --count HEAD.."$upstream" 2>/dev/null || echo 0)"
+
+  if [ "${ahead:-0}" -gt 0 ] && [ "${behind:-0}" -gt 0 ]; then
+    echo "    skip $label: diverged from $upstream (ahead $ahead, behind $behind) — not resetting"
+    return 0
+  fi
+  if [ "${ahead:-0}" -gt 0 ]; then
+    echo "    skip $label: ahead of $upstream by $ahead commit(s) — not discarding unpushed work"
+    git -C "$dir" log --oneline "$upstream"..HEAD 2>/dev/null | head -5 | sed 's/^/      /' || true
+    return 0
+  fi
+  if [ "${behind:-0}" -eq 0 ]; then
+    echo "    ok $label: already up to date with $upstream"
+    return 0
+  fi
+
+  echo "    git reset --hard $upstream — $label (behind $behind)"
   git -C "$dir" reset --hard "$upstream" 2>&1 | sed 's/^/      /' || {
     echo "    error: git reset --hard failed on $label" >&2
     return 1
@@ -673,11 +716,11 @@ git_force_pull_if_clean() {
   return 0
 }
 
-# Force-pull on a remote host if its GDR checkout is clean.
+# Force-pull on a remote host if its GDR checkout is clean / not ahead.
 # Searches the same candidate paths as local (via SSH).
 remote_git_force_pull_if_clean() {
   local target="$1" label="${2:-$target}"
-  local script
+  local script out ec
 
   script=$(
     cat <<'EOS'
@@ -697,14 +740,14 @@ if [ -z "$dir" ]; then
   exit 0
 fi
 if [ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]; then
-  echo "skip: local changes present — not force-pulling ($dir)"
+  echo "skip: uncommitted changes — not force-pulling ($dir)"
   git -C "$dir" status -sb | head -5
   exit 0
 fi
 branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
 echo "fetch $dir @ $branch"
-git -C "$dir" fetch --prune --tags origin 2>/dev/null \
-  || git -C "$dir" fetch --prune --tags
+git -C "$dir" fetch --prune --tags origin >/dev/null 2>&1 \
+  || git -C "$dir" fetch --prune --tags >/dev/null
 if upstream="$(git -C "$dir" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null)"; then
   :
 elif git -C "$dir" rev-parse --verify "origin/$branch" >/dev/null 2>&1; then
@@ -713,15 +756,37 @@ else
   echo "skip: no upstream for $branch"
   exit 0
 fi
-echo "reset --hard $upstream"
+ahead="$(git -C "$dir" rev-list --count "$upstream"..HEAD 2>/dev/null || echo 0)"
+behind="$(git -C "$dir" rev-list --count HEAD.."$upstream" 2>/dev/null || echo 0)"
+if [ "$ahead" -gt 0 ] && [ "$behind" -gt 0 ]; then
+  echo "skip: diverged from $upstream (ahead $ahead, behind $behind)"
+  exit 0
+fi
+if [ "$ahead" -gt 0 ]; then
+  echo "skip: ahead of $upstream by $ahead commit(s) — not discarding unpushed work"
+  exit 0
+fi
+if [ "$behind" -eq 0 ]; then
+  echo "ok: already up to date with $upstream"
+  exit 0
+fi
+echo "reset --hard $upstream (behind $behind)"
 git -C "$dir" reset --hard "$upstream"
 git -C "$dir" log -1 --oneline
 EOS
   )
 
   echo "    git pull — $label ($target)"
-  # shellcheck disable=SC2029
-  if ! ssh -o BatchMode=yes -o ConnectTimeout=15 "$target" "bash -s" <<<"$script" 2>&1 | sed 's/^/      /'; then
+  set +e
+  out="$(ssh -o BatchMode=yes -o ConnectTimeout=15 "$target" "bash -s" <<<"$script" 2>&1)"
+  ec=$?
+  set -e
+  printf '%s\n' "$out" | sed 's/^/      /'
+  if [ "$ec" -ne 0 ]; then
+    if printf '%s' "$out" | grep -qiE 'Permission denied|Could not resolve|Connection (timed out|refused)'; then
+      echo "    skip $label: SSH unreachable — fix keys/host and retry" >&2
+      return 0
+    fi
     echo "    error: remote git pull failed on $label" >&2
     return 1
   fi
