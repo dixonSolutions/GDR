@@ -19,6 +19,32 @@ use zbus::{proxy, zvariant::OwnedObjectPath, Connection};
 const RD_DEST: &str = "org.gnome.Mutter.RemoteDesktop";
 const SC_DEST: &str = "org.gnome.Mutter.ScreenCast";
 
+/// GNOME's screensaver. `GetActive` is true while the greeter/lock shield is
+/// up, which is exactly when Mutter refuses to hand a session to us.
+#[proxy(
+    interface = "org.gnome.ScreenSaver",
+    default_service = "org.gnome.ScreenSaver",
+    default_path = "/org/gnome/ScreenSaver"
+)]
+pub trait ScreenSaver {
+    fn get_active(&self) -> zbus::Result<bool>;
+}
+
+/// logind's view of our own session (`.../session/auto`). Used as the
+/// fallback lock probe and to name the session in the remedy we print.
+#[proxy(
+    interface = "org.freedesktop.login1.Session",
+    default_service = "org.freedesktop.login1",
+    default_path = "/org/freedesktop/login1/session/auto"
+)]
+pub trait LogindSession {
+    #[zbus(property)]
+    fn locked_hint(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn id(&self) -> zbus::Result<String>;
+}
+
 #[proxy(
     interface = "org.gnome.Mutter.RemoteDesktop",
     default_service = "org.gnome.Mutter.RemoteDesktop",
@@ -128,7 +154,16 @@ impl MutterSession {
         let conn = Connection::session().await?;
 
         let rd = RemoteDesktopProxy::new(&conn).await?;
-        let rd_session_path = rd.create_session().await?;
+        // The one failure that is not a bug in this code: Mutter refuses
+        // every unprivileged session while the screen is locked. Translate
+        // it here rather than letting "Session creation inhibited" reach a
+        // caller who will go looking for a permissions problem.
+        let rd_session_path = match rd.create_session().await {
+            Ok(path) => path,
+            Err(e) => {
+                return Err(session_failure(&conn, "RemoteDesktop.CreateSession", e).await)
+            }
+        };
         // zbus ProxyBuilder requires an explicit destination when the
         // object path is not the trait's default_path — otherwise you get
         // MissingParameter("destination").
@@ -168,10 +203,11 @@ impl MutterSession {
         // Mutter requires RemoteDesktop.Session.Start first; the stream is
         // often auto-started. Calling ScreenCast.Session.Start fails with
         // "Must be started from remote desktop session".
-        rd_session
-            .start()
-            .await
-            .context("RemoteDesktop.Session.Start")?;
+        // Same translation for Start: the screen can lock between
+        // CreateSession and here.
+        if let Err(e) = rd_session.start().await {
+            return Err(session_failure(&conn, "RemoteDesktop.Session.Start", e).await);
+        }
 
         match sc_stream.start().await {
             Ok(()) => {}
@@ -388,4 +424,158 @@ async fn discover_connectors() -> Result<Vec<String>> {
 
 fn is_virtual_connector(name: &str) -> bool {
     name.starts_with("Meta-") || name.starts_with("Virtual-")
+}
+
+/// What we could learn about the session's lock state on the error path.
+/// `locked` is `None` when neither probe answered — we then say nothing
+/// about the lock rather than guessing.
+#[derive(Debug, Default, PartialEq)]
+pub struct LockState {
+    pub locked: Option<bool>,
+    pub session_id: Option<String>,
+}
+
+/// Probe whether the GNOME session is locked.
+///
+/// Two independent sources, because either can be missing: GNOME's
+/// `org.gnome.ScreenSaver.GetActive` on the session bus (absent under a
+/// non-GNOME shell), and logind's `LockedHint` on the system bus (absent in
+/// containers without a seat). logind also gives us the session id, which is
+/// what `loginctl unlock-session` wants.
+pub async fn probe_lock_state(session_conn: &Connection) -> LockState {
+    let mut state = LockState::default();
+
+    if let Ok(ss) = ScreenSaverProxy::new(session_conn).await {
+        if let Ok(active) = ss.get_active().await {
+            state.locked = Some(active);
+        }
+    }
+
+    if let Ok(system) = Connection::system().await {
+        if let Ok(sess) = LogindSessionProxy::new(&system).await {
+            if let Ok(id) = sess.id().await {
+                state.session_id = Some(id);
+            }
+            if state.locked.is_none() {
+                if let Ok(hint) = sess.locked_hint().await {
+                    state.locked = Some(hint);
+                }
+            }
+        }
+    }
+
+    state
+}
+
+/// Mutter's refusal while the lock shield is up. It is deliberately generic
+/// upstream — `meta-dbus-session-manager` rejects every unprivileged
+/// CreateSession with this one string, and never mentions the screen lock.
+fn is_session_inhibited(dbus_msg: &str) -> bool {
+    dbus_msg.contains("Session creation inhibited")
+}
+
+/// Turn a Mutter session-creation failure into something a human (or an
+/// agent) can act on. Nothing here can un-inhibit Mutter; the whole point is
+/// that the caller stops hunting for a permission bug that does not exist.
+pub(crate) fn explain_session_failure(op: &str, dbus_msg: &str, lock: &LockState) -> String {
+    if !is_session_inhibited(dbus_msg) {
+        return format!("{op}: {dbus_msg}");
+    }
+
+    let unlock = match lock.session_id.as_deref() {
+        Some(id) => format!("loginctl unlock-session {id}"),
+        None => "loginctl unlock-session <id>  (loginctl list-sessions)".to_string(),
+    };
+
+    match lock.locked {
+        Some(true) => format!(
+            "{op}: the GNOME session is locked. Mutter refuses ScreenCast and \
+             RemoteDesktop to unprivileged clients while the lock shield is up, \
+             and no permission or portal change reaches it. Unlock the session \
+             (`{unlock}`) and retry — gdrd opens the display lazily, so the next \
+             screenshot or input request succeeds with no restart. \
+             (Mutter said: {dbus_msg})"
+        ),
+        Some(false) => format!(
+            "{op}: Mutter inhibited session creation, but the session does not \
+             report as locked. Another compositor-level inhibitor is active — \
+             check that gdrd runs inside the graphical session \
+             (`systemctl --user status gdr`) and that a shell is up. \
+             (Mutter said: {dbus_msg})"
+        ),
+        None => format!(
+            "{op}: Mutter inhibited session creation. This is almost always a \
+             locked screen — neither org.gnome.ScreenSaver nor logind answered, \
+             so confirm with `loginctl list-sessions` and unlock \
+             (`{unlock}`), then retry. (Mutter said: {dbus_msg})"
+        ),
+    }
+}
+
+/// Wrap a Mutter D-Bus failure with lock-state context. Only called on the
+/// error path, so the extra round trips cost nothing in the happy case.
+async fn session_failure(conn: &Connection, op: &str, err: zbus::Error) -> anyhow::Error {
+    let msg = err.to_string();
+    let lock = probe_lock_state(conn).await;
+    anyhow!(explain_session_failure(op, &msg, &lock))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn locked(id: Option<&str>) -> LockState {
+        LockState {
+            locked: Some(true),
+            session_id: id.map(str::to_string),
+        }
+    }
+
+    const INHIBITED: &str = "org.freedesktop.DBus.Error.Failed: Session creation inhibited";
+
+    #[test]
+    fn unrelated_errors_pass_through_untouched() {
+        let msg = explain_session_failure(
+            "RemoteDesktop.CreateSession",
+            "org.freedesktop.DBus.Error.ServiceUnknown: no such name",
+            &LockState::default(),
+        );
+        assert_eq!(
+            msg,
+            "RemoteDesktop.CreateSession: org.freedesktop.DBus.Error.ServiceUnknown: no such name"
+        );
+    }
+
+    #[test]
+    fn locked_session_names_the_unlock_command() {
+        let msg = explain_session_failure("RemoteDesktop.CreateSession", INHIBITED, &locked(Some("3")));
+        assert!(msg.contains("the GNOME session is locked"), "{msg}");
+        assert!(msg.contains("loginctl unlock-session 3"), "{msg}");
+        // The raw D-Bus text stays in the message so logs remain greppable.
+        assert!(msg.contains("Session creation inhibited"), "{msg}");
+    }
+
+    #[test]
+    fn locked_without_a_session_id_still_explains_how_to_find_it() {
+        let msg = explain_session_failure("RemoteDesktop.CreateSession", INHIBITED, &locked(None));
+        assert!(msg.contains("loginctl list-sessions"), "{msg}");
+    }
+
+    #[test]
+    fn inhibited_but_unlocked_does_not_claim_a_lock() {
+        let state = LockState {
+            locked: Some(false),
+            session_id: Some("3".into()),
+        };
+        let msg = explain_session_failure("RemoteDesktop.CreateSession", INHIBITED, &state);
+        assert!(msg.contains("does not report as locked"), "{msg}");
+        assert!(!msg.contains("the GNOME session is locked"), "{msg}");
+    }
+
+    #[test]
+    fn unknown_lock_state_hedges_instead_of_asserting() {
+        let msg = explain_session_failure("RemoteDesktop.CreateSession", INHIBITED, &LockState::default());
+        assert!(msg.contains("almost always a locked screen"), "{msg}");
+        assert!(msg.contains("loginctl list-sessions"), "{msg}");
+    }
 }

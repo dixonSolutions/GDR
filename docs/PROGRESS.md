@@ -66,6 +66,20 @@ Living checklist. Update this when a milestone lands or a decision flips.
 - [x] `.cursor/rules/gdr-device.mdc` — parse chat `-dev=`, status + screenshot
 - [x] MCP `gdr_status`, `gdr_device_add` / `remove` / `default`
 
+### 2026-09-08 — locked screen reads as a lock, not a permissions bug
+
+- [x] gdrd probes `org.gnome.ScreenSaver.GetActive` + logind `LockedHint`
+      on the Mutter session-creation error path
+- [x] `Session creation inhibited` translated to a message naming the lock
+      and the session's own `loginctl unlock-session <id>`
+- [x] Same translation on `RemoteDesktop.Session.Start` (screen can lock
+      between CreateSession and Start)
+- [x] MCP: `screen_locked` / `retryable: false` / `remedy` on every tool
+      error, via `mcp-server/src/lockHint.ts`
+- [x] Tests: 5 Rust (message classification), 4 node (`lockHint.test.ts`)
+- [ ] Not verified against a live lock — the host was unlocked and in use
+      by another agent, so the locked branch is covered by unit tests only
+
 ### Still open / next
 
 - [ ] Optional: `gdr_run_privileged` MCP tool
