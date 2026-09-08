@@ -182,6 +182,27 @@ socket open. gdrd itself tears down physical ScreenCast after
 Prefer a **single** `gdr` MCP entry (not `--per-device`) so you do not
 run three idle Node processes.
 
+## Locked screen
+
+Mutter refuses ScreenCast and RemoteDesktop to unprivileged clients while
+the lock shield is up. It reports this as a bare
+`org.freedesktop.DBus.Error.Failed: Session creation inhibited`, which names
+neither the lock nor a fix, so it reads like a permissions bug — it is not,
+and no portal or policy change reaches it.
+
+gdrd probes `org.gnome.ScreenSaver.GetActive` and logind's `LockedHint` on
+that error path and returns a message naming the lock and the exact
+`loginctl unlock-session <id>` for the session. MCP tools tag the payload
+`screen_locked: true`, `retryable: false`, plus a `remedy` string:
+
+```json
+{ "error": "RemoteDesktop.CreateSession: the GNOME session is locked. …",
+  "screen_locked": true, "retryable": false, "remedy": "…" }
+```
+
+Ask the user to unlock rather than retrying. Nothing needs restarting —
+gdrd opens the display lazily, so the next screenshot or input succeeds.
+
 ## Multi-host
 
 One MCP server process can address many saved profiles:

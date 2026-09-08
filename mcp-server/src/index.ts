@@ -29,6 +29,7 @@ import {
   FrameStateStore,
   type LayoutMode,
 } from "./screenshotLayout.js";
+import { screenLockFields } from "./lockHint.js";
 
 parseServerArgv();
 if (getDefaultDevice()) {
@@ -128,7 +129,10 @@ function textResult(payload: unknown, isError = false) {
 }
 
 function mapError(e: unknown) {
-  return textResult({ error: e instanceof Error ? e.message : String(e) }, true);
+  const error = e instanceof Error ? e.message : String(e);
+  // A locked screen is not a gdr misconfiguration and not worth a retry —
+  // flag it so the agent asks for an unlock instead.
+  return textResult({ error, ...screenLockFields(error) }, true);
 }
 
 const layoutProp = z
