@@ -25,9 +25,19 @@
    MCP keeps its process up for Cursor health, but drops the TLS link to
    gdrd after `GDR_MCP_IDLE_MS` (default 15s). Headless virtual Meta-*
    stays up once started (see HEADLESS.md).  
+7. **Hooks inherit the scope of what they watch** — a screen-activity
+   subscription needs `screenshot`, a window subscription needs `window`, and
+   listing or draining returns only the hooks a token's scopes cover. Each
+   hook records the scopes and token label it was created under, so a standing
+   watch can be audited after the token behind it is gone (see HOOKS.md).  
 
 ## Explicit tradeoffs you opted into
 
+- **An enabled activity hook streams the desktop continuously.** It holds
+  Mutter ScreenCast open for as long as it is switched on — that is what
+  makes it a watcher rather than a poll, and it defeats the idle teardown
+  above for the duration. `gdr hooks` shows what is enabled; disabling one
+  keeps its configuration so turning it back on is cheap.  
 - **Stored sudo/user passwords in plaintext** on the controller disk.  
 - **`gdr_get_password`** returns plaintext into the model transcript.  
   Safer future alternative: `gdr_run_privileged` (password stays in-process).  

@@ -57,6 +57,14 @@ import {
   windowSummary,
 } from "./windows.js";
 import {
+  activitySpec,
+  hookEventSummary,
+  hookSummary,
+  pollNote,
+  windowSpec,
+  WINDOW_HOOK_EVENTS,
+} from "./hooks.js";
+import {
   appendWindowLog,
   clearPin,
   deviceIdFor,
@@ -411,35 +419,58 @@ server.tool(
   "Screenshot a rectangle of the desktop at full native resolution. Use this " +
     "for small targets — tray icons, checkboxes, dropdown arrows, tight menu " +
     "rows — where a full screenshot does not have the pixels to aim reliably. " +
-    "x,y,width,height are in the pixel space of the last full gdr_screenshot. " +
-    "Afterwards, gdr_click coordinates are read off the ZOOM image; take a " +
-    "full gdr_screenshot again before clicking anywhere outside it.",
+    "By default x,y,width,height are in the pixel space of the last full " +
+    'gdr_screenshot. Pass space="stream" to give them in capture-stream ' +
+    "pixels instead — that is the space gdr_hook_events reports activity " +
+    "circles in, and it needs no prior screenshot, so a hook can send you " +
+    "straight here. Afterwards, gdr_click coordinates are read off the ZOOM " +
+    "image; take a full gdr_screenshot again before clicking outside it.",
   {
     ...deviceArgs,
-    x: z.number().describe("Left edge, in last screenshot image pixels"),
-    y: z.number().describe("Top edge, in last screenshot image pixels"),
-    width: z.number().positive().describe("Region width, in image pixels"),
-    height: z.number().positive().describe("Region height, in image pixels"),
+    x: z.number().describe("Left edge"),
+    y: z.number().describe("Top edge"),
+    width: z.number().positive().describe("Region width"),
+    height: z.number().positive().describe("Region height"),
+    space: z
+      .enum(["image", "stream"])
+      .default("image")
+      .describe(
+        'Coordinate space of x/y/width/height. "image" (default) is the last ' +
+          'gdr_screenshot\'s pixels and requires one to have been taken. "stream" is ' +
+          "native capture pixels — what gdr_hook_events, Region and gdr_windows' " +
+          "stream_region use — and needs no prior screenshot."
+      ),
     settle: settleProp,
   },
-  async ({ host, dev, x, y, width, height, settle }) => {
+  async ({ host, dev, x, y, width, height, space, settle }) => {
     try {
-      const key = deviceKey(host, dev);
-      // The region arrives in the previous image's space; convert both
-      // corners through the same remap the clicks use, so a zoom taken from
-      // a downscaled screenshot lands on the pixels the agent pointed at.
-      const topLeft = frames.toStream(key, x, y);
-      const bottomRight = frames.toStream(key, x + width, y + height);
-      return await captureResult(host, dev, {
-        profile: "raw",
-        settle,
-        region: {
-          x: Math.round(topLeft.stream_x),
-          y: Math.round(topLeft.stream_y),
-          width: Math.max(1, Math.round(bottomRight.stream_x - topLeft.stream_x)),
-          height: Math.max(1, Math.round(bottomRight.stream_y - topLeft.stream_y)),
-        },
-      });
+      // Stream coordinates are already the space gdrd crops in, so they go
+      // through untouched. This is what makes "a hook told me where to look"
+      // a complete workflow: remapping from image space needs a screenshot,
+      // and the whole point of the hook is not having taken one.
+      const region =
+        space === "stream"
+          ? {
+              x: Math.round(x),
+              y: Math.round(y),
+              width: Math.max(1, Math.round(width)),
+              height: Math.max(1, Math.round(height)),
+            }
+          : (() => {
+              const key = deviceKey(host, dev);
+              // Convert both corners through the same remap the clicks use,
+              // so a zoom taken from a downscaled screenshot lands on the
+              // pixels the agent pointed at.
+              const topLeft = frames.toStream(key, x, y);
+              const bottomRight = frames.toStream(key, x + width, y + height);
+              return {
+                x: Math.round(topLeft.stream_x),
+                y: Math.round(topLeft.stream_y),
+                width: Math.max(1, Math.round(bottomRight.stream_x - topLeft.stream_x)),
+                height: Math.max(1, Math.round(bottomRight.stream_y - topLeft.stream_y)),
+              };
+            })();
+      return await captureResult(host, dev, { profile: "raw", settle, region });
     } catch (e) {
       return mapError(e);
     }
@@ -1793,6 +1824,423 @@ server.tool(
           ? "An existing window was raised; it is now on screen."
           : "The app was started. Give it a moment, then gdr_windows to find its window " +
             "(or gdr_window_events with wait_ms to be told when it appears).",
+      });
+    } catch (e) {
+      return mapError(e);
+    }
+  }
+);
+
+const bufferArg = (fallback: number) =>
+  z
+    .number()
+    .int()
+    .min(0)
+    .max(60000)
+    .default(fallback)
+    .describe(
+      "Buffer time in ms: how long the watched thing must hold still before the " +
+        "event is sent. The report then describes the whole burst, and the state " +
+        "in it has been stable for this long — which is what makes it safe to act on."
+    );
+
+const maxBurstArg = z
+  .number()
+  .int()
+  .min(0)
+  .default(5000)
+  .describe(
+    "Send a still-moving burst anyway after this long, flagged settled:false. " +
+      "0 waits forever for quiet (a video would then never report)."
+  );
+
+/** Shape both creation tools return, so the two read the same. */
+function hookResult(
+  hook: ReturnType<typeof hookSummary>,
+  created: boolean,
+  extra: Record<string, unknown> = {}
+) {
+  return textResult({
+    ok: true,
+    action: created ? "created" : "updated",
+    hook,
+    ...extra,
+    note:
+      "Drain it with gdr_hook_events (pass wait_ms to block until something happens). " +
+      "Toggle it with gdr_hooks({action:'disable'|'enable', id}).",
+  });
+}
+
+server.tool(
+  "gdr_hook_screen",
+  "Subscribe to screen activity: gdrd watches the capture stream on its own " +
+    "and reports a circle covering whatever moved, once it has held still for " +
+    "buffer_ms. Point it at the whole screen, a fixed rectangle, or one window " +
+    "(which it then follows as the window moves). This is the tool for 'tell me " +
+    "when something happens' instead of screenshotting in a loop. Note the cost: " +
+    "while an activity hook is enabled gdrd keeps the desktop capture running, " +
+    "which is visible to anyone at the machine. Needs the screenshot scope. " +
+    "Pass id= to reconfigure an existing hook instead of creating a second one. " +
+    "IF IT REPORTS NOTHING, check the thing you are watching is actually being " +
+    "drawn before you touch threshold/grid: this hook sees the composited screen, " +
+    "so a background browser tab, an occluded window or a minimized one produces " +
+    "no activity at any sensitivity, because it genuinely is not repainting.",
+  {
+    ...deviceArgs,
+    id: z
+      .string()
+      .optional()
+      .describe("Existing hook id to reconfigure in place, from gdr_hooks."),
+    label: z.string().optional().describe("Friendly name, echoed on every event."),
+    enabled: z.boolean().default(true).describe("Create/leave it switched on."),
+    window_id: z
+      .number()
+      .int()
+      .optional()
+      .describe("Watch only this window id (the hook's own id is the `id` argument)."),
+    app_id: z.string().optional().describe("Watch only this window, by desktop-file id."),
+    wm_class: z.string().optional().describe("Watch only the window whose WM_CLASS contains this."),
+    title: z.string().optional().describe("Watch only the window whose title contains this."),
+    pid: z.number().int().optional().describe("Watch only the window owned by this process."),
+    focused: z.boolean().optional().describe("Watch whatever currently has keyboard focus."),
+    region: z
+      .object({
+        x: z.number().int().min(0),
+        y: z.number().int().min(0),
+        width: z.number().int().min(1),
+        height: z.number().int().min(1),
+      })
+      .optional()
+      .describe(
+        "Watch only this rectangle of capture-stream pixels (the space gdr_click " +
+          "uses, not image space). Ignored when a window selector is given."
+      ),
+    buffer_ms: bufferArg(400),
+    min_interval_ms: z
+      .number()
+      .int()
+      .min(0)
+      .default(0)
+      .describe(
+        "Never report more often than this. 0 (default) is off. Reach for it when " +
+          "what you are watching repaints on a timer — a clock, a spinner, a blinking " +
+          "panel — where buffer_ms cannot help because every repaint is its own " +
+          "settled burst and you get two identical events a second. It coalesces " +
+          "rather than drops: the event that comes out covers everything since the last."
+      ),
+    max_burst_ms: maxBurstArg,
+    poll_ms: z
+      .number()
+      .int()
+      .min(30)
+      .max(10000)
+      .default(120)
+      .describe("Sampling cadence. Bounds how quickly a change is noticed."),
+    threshold: z
+      .number()
+      .int()
+      .min(1)
+      .max(255)
+      .default(12)
+      .describe(
+        "Per-cell brightness delta that counts as change. Below ~8 the compositor's " +
+          "own noise reads as motion."
+      ),
+    min_cells: z
+      .number()
+      .int()
+      .min(1)
+      .default(1)
+      .describe("Cells that must change for a sample to count. Raise to ignore a caret."),
+    grid: z
+      .number()
+      .int()
+      .min(8)
+      .max(256)
+      .default(64)
+      .describe(
+        "Diff resolution along the long edge. Higher = finer circles and a smaller area " +
+          "averaged per cell, so small changes survive the averaging. Raise this (128-256) " +
+          "with `threshold` lowered (2-4) when what you are watching is text."
+      ),
+    max_radius: z
+      .number()
+      .int()
+      .min(0)
+      .default(0)
+      .describe(
+        "Drop bursts whose circle is larger than this radius in stream pixels — " +
+          "a way to ignore workspace switches and video. 0 keeps everything."
+      ),
+  },
+  async ({
+    host,
+    dev,
+    id,
+    label,
+    enabled,
+    region,
+    buffer_ms,
+    max_burst_ms,
+    poll_ms,
+    threshold,
+    min_cells,
+    grid,
+    max_radius,
+    min_interval_ms,
+    window_id,
+    app_id,
+    wm_class,
+    title,
+    pid,
+    focused,
+  }) => {
+    try {
+      const client = clientFor(host, dev);
+      const target = targetFromArgs({ id: window_id, app_id, wm_class, title, pid, focused });
+      const spec = activitySpec({
+        target: isEmptyTarget(target) ? null : target,
+        region: region ?? null,
+        buffer_ms,
+        min_interval_ms,
+        max_burst_ms,
+        poll_ms,
+        threshold,
+        min_cells,
+        grid,
+        max_radius,
+      });
+      const hook = id
+        ? await client.hookUpdate(id, { enabled, label, spec })
+        : await client.hookCreate(spec, label, enabled);
+      return hookResult(hookSummary(hook), !id, {
+        coordinates:
+          "Circles come back in capture-stream pixels, and also in your last " +
+          "screenshot's image space when one exists — those are the ones gdr_click takes.",
+      });
+    } catch (e) {
+      return mapError(e);
+    }
+  }
+);
+
+server.tool(
+  "gdr_hook_window",
+  "Subscribe to window lifecycle: opens, closes, resizes, moves, retitles. " +
+    "Each event carries the window's title and size, the owning process (pid, " +
+    "user, executable, command line) and what the geometry was before. " +
+    "Geometry changes are buffered, so a drag-resize reports once at its final " +
+    "size rather than a hundred times on the way there; closes are reported " +
+    "immediately, since there is nothing left to settle. Filter to one app with " +
+    "app_id/title, or leave it open to watch the whole desktop. Needs the window " +
+    "scope. Pass id= to reconfigure an existing hook in place.",
+  {
+    ...deviceArgs,
+    id: z
+      .string()
+      .optional()
+      .describe("Existing hook id to reconfigure in place, from gdr_hooks."),
+    label: z.string().optional().describe("Friendly name, echoed on every event."),
+    enabled: z.boolean().default(true).describe("Create/leave it switched on."),
+    events: z
+      .array(z.enum(WINDOW_HOOK_EVENTS))
+      .min(1)
+      .default(["opened", "closed", "resized"])
+      .describe("Which lifecycle events to report."),
+    window_id: z
+      .number()
+      .int()
+      .optional()
+      .describe("Watch only this window id (the hook's own id is the `id` argument)."),
+    app_id: z.string().optional().describe('Watch only this desktop-file id, e.g. "chromium".'),
+    wm_class: z.string().optional().describe("Watch only windows whose WM_CLASS contains this."),
+    title: z.string().optional().describe("Watch only windows whose title contains this."),
+    pid: z.number().int().optional().describe("Watch only windows owned by this process."),
+    buffer_ms: bufferArg(250),
+    max_burst_ms: maxBurstArg,
+    poll_ms: z
+      .number()
+      .int()
+      .min(50)
+      .max(10000)
+      .default(250)
+      .describe(
+        "How often the window list is re-read. Bounds how quickly an open or a " +
+          "resize is noticed."
+      ),
+    include_skip_taskbar: z
+      .boolean()
+      .default(false)
+      .describe("Include docks, panels and notification popups, which are normally noise."),
+    include_process: z
+      .boolean()
+      .default(true)
+      .describe("Look up the owning process in /proc for each event."),
+    geometry_threshold: z
+      .number()
+      .int()
+      .min(0)
+      .default(2)
+      .describe("Ignore moves/resizes smaller than this many logical pixels."),
+  },
+  async ({
+    host,
+    dev,
+    id,
+    label,
+    enabled,
+    events,
+    window_id,
+    app_id,
+    wm_class,
+    title,
+    pid,
+    buffer_ms,
+    max_burst_ms,
+    poll_ms,
+    include_skip_taskbar,
+    include_process,
+    geometry_threshold,
+  }) => {
+    try {
+      const client = clientFor(host, dev);
+      const target = targetFromArgs({ id: window_id, app_id, wm_class, title, pid });
+      const spec = windowSpec({
+        target: isEmptyTarget(target) ? null : target,
+        events,
+        buffer_ms,
+        max_burst_ms,
+        poll_ms,
+        include_skip_taskbar,
+        include_process,
+        geometry_threshold,
+      });
+      const hook = id
+        ? await client.hookUpdate(id, { enabled, label, spec })
+        : await client.hookCreate(spec, label, enabled);
+      return hookResult(hookSummary(hook), !id);
+    } catch (e) {
+      return mapError(e);
+    }
+  }
+);
+
+server.tool(
+  "gdr_hooks",
+  "List the subscriptions on a device, and switch them on or off. Disabling " +
+    "keeps the hook, its configuration and its buffered events, so 'watch while " +
+    "I do this, then stop' costs one call each way. Each hook reports the scope " +
+    "it needs and the scopes the token that created it held — a hook you can see " +
+    "here is one this token is allowed to read and change.",
+  {
+    ...deviceArgs,
+    action: z
+      .enum(["list", "enable", "disable", "remove"])
+      .default("list")
+      .describe("What to do. Everything but list needs id=."),
+    id: z.string().optional().describe("Hook id, for enable/disable/remove."),
+  },
+  async ({ host, dev, action, id }) => {
+    try {
+      const client = clientFor(host, dev);
+      if (action === "list") {
+        const hooks = await client.hookList();
+        return textResult({
+          count: hooks.length,
+          hooks: hooks.map(hookSummary),
+          note: hooks.length
+            ? "Drain events with gdr_hook_events."
+            : "No hooks yet — create one with gdr_hook_screen or gdr_hook_window.",
+        });
+      }
+      if (!id) {
+        return textResult(
+          { error: `${action} needs id= — call gdr_hooks({action:"list"}) to see them.` },
+          true
+        );
+      }
+      const hook =
+        action === "remove"
+          ? await client.hookRemove(id)
+          : await client.hookUpdate(id, { enabled: action === "enable" });
+      return textResult({
+        ok: true,
+        action,
+        hook: hookSummary(hook),
+        note:
+          action === "remove"
+            ? "Gone, along with any events of its that were still buffered."
+            : action === "disable"
+              ? "Switched off. Its config and buffered events are kept; enable it to resume."
+              : "Switched on. It starts reporting on its next sample.",
+      });
+    } catch (e) {
+      return mapError(e);
+    }
+  }
+);
+
+server.tool(
+  "gdr_hook_events",
+  "Drain what the subscriptions have seen. Sequence numbers are shared across " +
+    "hooks, so one call collects every subscription at once — pass the previous " +
+    "reply's next_seq as since= to continue without gaps or repeats. With " +
+    "wait_ms > 0 the call blocks until something lands, which is how to wait for " +
+    "an app to finish opening without a screenshot loop. Activity events carry a " +
+    "circle in both stream and screenshot-image coordinates; window events carry " +
+    "title, size and owning process.",
+  {
+    ...deviceArgs,
+    id: z
+      .string()
+      .optional()
+      .describe(
+        "Only this hook. Omit to drain every hook at once — which is the simpler " +
+          "loop, because sequence numbers are global: a next_seq from a filtered " +
+          "drain is a cursor for THAT filter only."
+      ),
+    since: z
+      .number()
+      .int()
+      .min(0)
+      .default(0)
+      .describe(
+        "Exclusive cursor: returns events with seq > since. Pass back the previous " +
+          "reply's next_seq verbatim — do NOT add one to it. 0 returns everything buffered."
+      ),
+    limit: z.number().int().min(1).max(512).default(100),
+    wait_ms: z
+      .number()
+      .int()
+      .min(0)
+      .max(120000)
+      .default(0)
+      .describe(
+        "Block up to this many ms for the first event. 0 returns immediately. " +
+          "Note this occupies the connection to this device for the duration."
+      ),
+  },
+  async ({ host, dev, id, since, limit, wait_ms }) => {
+    try {
+      const client = clientFor(host, dev);
+      const result = await client.hookPoll(id ?? null, since, limit, wait_ms);
+      // Activity circles are only clickable against a screenshot this device
+      // has actually produced; without one they stay in stream coordinates.
+      const frame = frames.get(deviceKey(host, dev));
+      return textResult({
+        count: result.events.length,
+        // Named for how it is used, not for what it counts: it is the last
+        // seq handed over, and `since` is exclusive, so passing it straight
+        // back is correct and adding one to it silently drops an event.
+        next_seq: result.next_seq,
+        cursor_scope: result.cursor_scope ?? "all",
+        ...(result.skipped_other_hooks
+          ? { skipped_other_hooks: result.skipped_other_hooks }
+          : {}),
+        dropped: result.dropped,
+        events: result.events.map((e) => hookEventSummary(e, frame)),
+        hooks: result.hooks.map(hookSummary),
+        note: pollNote(result),
       });
     } catch (e) {
       return mapError(e);

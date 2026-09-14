@@ -148,6 +148,167 @@ export interface WindowList {
   seq: number;
 }
 
+/** A circle in capture-stream pixels — the space gdr_click already uses. */
+export interface Circle {
+  x: number;
+  y: number;
+  radius: number;
+}
+
+export type ActivityArea =
+  | { scope: "screen" }
+  | { scope: "region"; region: Region }
+  | {
+      scope: "window";
+      id: number;
+      title: string | null;
+      app_id: string | null;
+      region: Region;
+    };
+
+/** One settled burst of screen change. */
+export interface ActivityReport {
+  circle: Circle;
+  bbox: Region;
+  started_at: string;
+  ended_at: string;
+  duration_ms: number;
+  buffer_ms: number;
+  samples: number;
+  changed_fraction: number;
+  area: ActivityArea;
+  stream_width: number;
+  stream_height: number;
+  /** False when the burst was cut off while still moving. */
+  settled: boolean;
+  /**
+   * Whether the session was locked when this was measured.
+   *
+   * The capture stream keeps running across a lock, so without this an agent
+   * cannot tell that the thing it is watching move is a clock on a lock
+   * screen. `null` when gdrd could not ask.
+   */
+  session_locked: boolean | null;
+}
+
+/** The process behind a window, as /proc describes it. */
+export interface ProcessInfo {
+  pid: number;
+  uid: number | null;
+  user: string | null;
+  comm: string | null;
+  exe: string | null;
+  cmdline: string | null;
+  ppid: number | null;
+  error: string | null;
+}
+
+export interface WindowChange {
+  frame_rect: LogicalRect | null;
+  title: string | null;
+  minimized: boolean | null;
+  workspace: number | null;
+  dw: number | null;
+  dh: number | null;
+  dx: number | null;
+  dy: number | null;
+}
+
+export interface WindowEventInfo {
+  id: number;
+  title: string | null;
+  app_id: string | null;
+  wm_class: string | null;
+  pid: number;
+  process: ProcessInfo | null;
+  window_type: string;
+  frame_rect: LogicalRect;
+  stream_region: Region | null;
+  monitor: number;
+  workspace: number | null;
+  minimized: boolean;
+  focus: boolean;
+  maximized: string;
+  fullscreen: boolean;
+  previous: WindowChange | null;
+  samples: number;
+  settled: boolean;
+}
+
+export interface ActivitySpec {
+  target?: WindowTarget | null;
+  region?: Region | null;
+  buffer_ms?: number;
+  min_interval_ms?: number;
+  max_burst_ms?: number;
+  poll_ms?: number;
+  threshold?: number;
+  min_cells?: number;
+  grid?: number;
+  max_radius?: number;
+}
+
+export interface WindowHookSpec {
+  target?: WindowTarget | null;
+  events?: string[];
+  buffer_ms?: number;
+  max_burst_ms?: number;
+  poll_ms?: number;
+  include_skip_taskbar?: boolean;
+  geometry_threshold?: number;
+  include_process?: boolean;
+}
+
+export type HookSpec =
+  | ({ kind: "activity" } & ActivitySpec)
+  | ({ kind: "window" } & WindowHookSpec);
+
+export type HookState = "watching" | "paused" | "waiting" | "failing";
+
+export interface HookStatus {
+  id: string;
+  kind: "activity" | "window";
+  label: string | null;
+  enabled: boolean;
+  state: HookState;
+  spec: HookSpec;
+  summary: string;
+  created_at: string;
+  updated_at: string;
+  /** Scope a token must hold to see, change or drain this hook. */
+  required_scope: string;
+  /** Scopes the token that created it held at the time. */
+  created_with_scopes: string[];
+  created_by: string | null;
+  events_emitted: number;
+  last_event_at: string | null;
+  last_error: string | null;
+  buffered: number;
+}
+
+export interface HookEvent {
+  seq: number;
+  hook_id: string;
+  hook_kind: "activity" | "window";
+  label: string | null;
+  kind: string;
+  at: string;
+  activity: ActivityReport | null;
+  window: WindowEventInfo | null;
+}
+
+export interface HookPollResult {
+  events: HookEvent[];
+  /** Cursor for the next poll **of the same shape** — see `cursor_scope`. */
+  next_seq: number;
+  /** null for a drain of every hook; otherwise the hook id it was filtered to. */
+  cursor_scope: string | null;
+  /** Other hooks' events lying inside the range a filtered drain covered. */
+  skipped_other_hooks: number;
+  dropped: boolean;
+  hooks: HookStatus[];
+}
+
 export type Request =
   | { type: "Auth"; token: string }
   | { type: "Screenshot"; connector: string | null }
@@ -172,6 +333,23 @@ export type Request =
   | { type: "LaunchApp"; app_id: string }
   | { type: "ListApps"; filter?: string | null }
   | { type: "WindowEvents"; since?: number; limit?: number; wait_ms?: number }
+  | ({ type: "HookCreate"; label?: string | null; enabled?: boolean } & HookSpec)
+  | {
+      type: "HookUpdate";
+      id: string;
+      enabled?: boolean | null;
+      label?: string | null;
+      spec?: HookSpec | null;
+    }
+  | { type: "HookRemove"; id: string }
+  | { type: "HookList" }
+  | {
+      type: "HookPoll";
+      id?: string | null;
+      since?: number;
+      limit?: number;
+      wait_ms?: number;
+    }
   | { type: "Ping" };
 
 export type Response =
@@ -198,6 +376,9 @@ export type Response =
       dropped: boolean;
       reset: boolean;
     }
+  | { type: "Hook"; hook: HookStatus }
+  | { type: "Hooks"; hooks: HookStatus[] }
+  | ({ type: "HookEvents" } & HookPollResult)
   | { type: "Pong" }
   | { type: "Error"; message: string };
 
@@ -447,6 +628,71 @@ export class GdrClient {
     if (resp.type !== "WindowEvents") {
       throw new Error(`expected WindowEvents, got ${resp.type}`);
     }
+    return resp;
+  }
+
+  async hookCreate(
+    spec: HookSpec,
+    label?: string | null,
+    enabled = true
+  ): Promise<HookStatus> {
+    const resp = await this.request({
+      type: "HookCreate",
+      label: label ?? null,
+      enabled,
+      ...spec,
+    });
+    if (resp.type === "Error") throw new Error(resp.message);
+    if (resp.type !== "Hook") throw new Error(`expected Hook, got ${resp.type}`);
+    return resp.hook;
+  }
+
+  async hookUpdate(
+    id: string,
+    patch: { enabled?: boolean; label?: string; spec?: HookSpec }
+  ): Promise<HookStatus> {
+    const resp = await this.request({
+      type: "HookUpdate",
+      id,
+      enabled: patch.enabled ?? null,
+      label: patch.label ?? null,
+      spec: patch.spec ?? null,
+    });
+    if (resp.type === "Error") throw new Error(resp.message);
+    if (resp.type !== "Hook") throw new Error(`expected Hook, got ${resp.type}`);
+    return resp.hook;
+  }
+
+  async hookRemove(id: string): Promise<HookStatus> {
+    const resp = await this.request({ type: "HookRemove", id });
+    if (resp.type === "Error") throw new Error(resp.message);
+    if (resp.type !== "Hook") throw new Error(`expected Hook, got ${resp.type}`);
+    return resp.hook;
+  }
+
+  async hookList(): Promise<HookStatus[]> {
+    const resp = await this.request({ type: "HookList" });
+    if (resp.type === "Error") throw new Error(resp.message);
+    if (resp.type !== "Hooks") throw new Error(`expected Hooks, got ${resp.type}`);
+    return resp.hooks;
+  }
+
+  async hookPoll(
+    id: string | null,
+    since = 0,
+    limit = 100,
+    waitMs = 0
+  ): Promise<HookPollResult> {
+    const resp = await this.request({
+      type: "HookPoll",
+      id: id ?? null,
+      since,
+      limit,
+      wait_ms: waitMs,
+    });
+    if (resp.type === "Error") throw new Error(resp.message);
+    if (resp.type !== "HookEvents")
+      throw new Error(`expected HookEvents, got ${resp.type}`);
     return resp;
   }
 

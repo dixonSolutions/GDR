@@ -72,6 +72,11 @@ pub struct KeepaliveConsumer {
     appsink: AppSink,
     node_id: u32,
     prerolled: bool,
+    /// Caps the stream negotiated. Kept for diagnostics: a stream that
+    /// negotiates a size and then never delivers a buffer is a different
+    /// failure from one that never negotiates, and the two need different
+    /// advice.
+    negotiated: (u32, u32),
 }
 
 impl KeepaliveConsumer {
@@ -134,12 +139,15 @@ impl KeepaliveConsumer {
             .static_pad("src")
             .ok_or_else(|| anyhow!("src pad"))?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Assigned on the only path that leaves this loop without returning.
+        let negotiated;
         loop {
             if let Some(c) = pad.current_caps() {
                 if let Some(s) = c.structure(0) {
                     let w: i32 = s.get("width").unwrap_or(0);
                     let h: i32 = s.get("height").unwrap_or(0);
                     if w >= 640 && h >= 480 {
+                        negotiated = (w as u32, h as u32);
                         tracing::info!(
                             "keepalive negotiated {w}x{h} on pipewire node {node_id}"
                         );
@@ -174,11 +182,17 @@ impl KeepaliveConsumer {
             appsink,
             node_id,
             prerolled,
+            negotiated,
         })
     }
 
     pub fn node_id(&self) -> u32 {
         self.node_id
+    }
+
+    /// Size the stream negotiated, or `(0, 0)` before negotiation.
+    pub fn negotiated(&self) -> (u32, u32) {
+        self.negotiated
     }
 
     /// Whether the stream delivered a frame at startup.
@@ -246,7 +260,13 @@ impl KeepaliveConsumer {
                 self.appsink
                     .try_pull_sample(gst::ClockTime::from_seconds(5))
             })
-            .ok_or_else(|| anyhow!(NoFrame))
+            .ok_or_else(|| {
+                anyhow!(NoFrame {
+                    node_id: self.node_id,
+                    negotiated: self.negotiated,
+                    prerolled: self.prerolled,
+                })
+            })
     }
 
     pub fn capture_frame(&self, opts: &FrameOptions) -> Result<CapturedFrame> {
@@ -312,11 +332,48 @@ fn fault_preroll() -> bool {
 /// Distinguished from other capture failures because it is the one kind that
 /// a pipeline rebuild can plausibly fix, and the only one worth retrying.
 #[derive(Debug)]
-pub struct NoFrame;
+pub struct NoFrame {
+    pub node_id: u32,
+    pub negotiated: (u32, u32),
+    /// Whether this consumer ever saw a frame. `false` means the stream has
+    /// produced nothing since it attached, which is a different problem from
+    /// a stream that worked and then stopped.
+    pub prerolled: bool,
+}
 
 impl std::fmt::Display for NoFrame {
+    /// Say what the compositor actually did, and what that state looks like.
+    ///
+    /// "no frame from the capture stream" was the whole message for a long
+    /// time, and it is useless in the one case that produces it most: a
+    /// monitor nothing is painting. Measured for comparison, a plain
+    /// `gnome-shell --headless --virtual-monitor WxH` hands over its first
+    /// frame in ~50 ms whether or not anything is on screen — so "silent
+    /// since attach" is never just slowness, and waiting longer will not fix
+    /// it.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("no frame from the capture stream")
+        let (w, h) = self.negotiated;
+        if self.prerolled {
+            return write!(
+                f,
+                "the capture stream (PipeWire node {}) delivered frames earlier but has \
+                 none now. The compositor has stopped painting this monitor — it may have \
+                 been unplugged, blanked, or the session replaced under us.",
+                self.node_id
+            );
+        }
+        write!(
+            f,
+            "the compositor accepted the capture stream (PipeWire node {}, negotiated \
+             {w}x{h}) and has never produced a single frame; gdrd already retried with a \
+             fresh Mutter session. That is what a monitor nobody is painting looks like: \
+             a `gnome-shell --devkit` / mdk session whose viewer is not displaying it, or \
+             a virtual monitor with no consumer. Input will not start it — pointer motion \
+             on an unpainted monitor produces no damage. A plain \
+             `gnome-shell --headless --virtual-monitor {w}x{h}` session delivers its first \
+             frame in well under a second, idle or not, so this is the session, not gdr.",
+            self.node_id
+        )
     }
 }
 
@@ -594,7 +651,17 @@ fn encode(img: &image::RgbImage, format: ImageFormat, quality: u8) -> Result<Vec
     Ok(out)
 }
 
-fn sample_to_frame(sample: &gst::Sample, opts: &FrameOptions) -> Result<CapturedFrame> {
+/// Size and channel order of a negotiated frame.
+#[derive(Clone, Copy, Debug)]
+struct FrameGeom {
+    width: u32,
+    height: u32,
+    /// True for BGRA/BGRx buffers, where red and blue arrive swapped.
+    swap_rb: bool,
+}
+
+/// Read frame dimensions and pixel order off the sample's caps.
+fn frame_geom(sample: &gst::Sample) -> Result<FrameGeom> {
     let caps = sample.caps().ok_or_else(|| anyhow!("sample has no caps"))?;
     let s = caps.structure(0).ok_or_else(|| anyhow!("no caps structure"))?;
     let width: i32 = s.get("width")?;
@@ -602,15 +669,28 @@ fn sample_to_frame(sample: &gst::Sample, opts: &FrameOptions) -> Result<Captured
     if width <= 0 || height <= 0 {
         return Err(anyhow!("invalid frame size {width}x{height}"));
     }
-    let (width, height) = (width as u32, height as u32);
-    note_stream_size(width, height);
+    let pixel_format: String = s.get::<String>("format").unwrap_or_else(|_| "RGBA".into());
+    let swap_rb = match pixel_format.as_str() {
+        "RGBA" | "RGBx" => false,
+        "BGRA" | "BGRx" => true,
+        other => {
+            return Err(anyhow!(
+                "unsupported pixel format {other:?} (expected RGBA/BGRA)"
+            ))
+        }
+    };
+    Ok(FrameGeom {
+        width: width as u32,
+        height: height as u32,
+        swap_rb,
+    })
+}
 
-    let buffer = sample.buffer().ok_or_else(|| anyhow!("sample has no buffer"))?;
-    let map = buffer.map_readable().context("failed to map buffer")?;
-    let bytes = map.as_slice();
-
-    // GStreamer may pad rows. Derive the real stride from the buffer rather
-    // than assuming width*4, which silently skews the image when padded.
+/// Real row stride of a mapped buffer.
+///
+/// GStreamer may pad rows. Derive the stride from the buffer rather than
+/// assuming `width * 4`, which silently skews the image when padded.
+fn frame_stride(bytes: &[u8], width: u32, height: u32) -> Result<usize> {
     let tight = (width as usize)
         .checked_mul(4)
         .ok_or_else(|| anyhow!("frame width overflow"))?;
@@ -628,17 +708,21 @@ fn sample_to_frame(sample: &gst::Sample, opts: &FrameOptions) -> Result<Captured
             bytes.len()
         ));
     }
+    Ok(stride)
+}
 
-    let pixel_format: String = s.get::<String>("format").unwrap_or_else(|_| "RGBA".into());
-    let swap_rb = match pixel_format.as_str() {
-        "RGBA" | "RGBx" => false,
-        "BGRA" | "BGRx" => true,
-        other => {
-            return Err(anyhow!(
-                "unsupported pixel format {other:?} (expected RGBA/BGRA)"
-            ))
-        }
-    };
+fn sample_to_frame(sample: &gst::Sample, opts: &FrameOptions) -> Result<CapturedFrame> {
+    let FrameGeom {
+        width,
+        height,
+        swap_rb,
+    } = frame_geom(sample)?;
+    note_stream_size(width, height);
+
+    let buffer = sample.buffer().ok_or_else(|| anyhow!("sample has no buffer"))?;
+    let map = buffer.map_readable().context("failed to map buffer")?;
+    let bytes = map.as_slice();
+    let stride = frame_stride(bytes, width, height)?;
 
     let region = clamp_region(opts.region, width, height)?;
     let mut img = crop_to_rgb(bytes, stride, swap_rb, region)?;
@@ -670,6 +754,212 @@ fn sample_to_frame(sample: &gst::Sample, opts: &FrameOptions) -> Result<Captured
         image_height: img.height(),
         hash,
         settled: true,
+    })
+}
+
+/// A frame reduced to a coarse luma grid, for change detection.
+///
+/// The activity watcher compares these, not images: a 64-cell grid is a few
+/// kilobytes and a few hundred microseconds to build, so a hook can sample
+/// eight times a second without competing with real captures for CPU.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProbeFrame {
+    /// Mean luma per cell, row-major, `rows * cols` entries.
+    pub cells: Vec<u8>,
+    pub cols: u32,
+    pub rows: u32,
+    /// Portion of the stream this grid covers, in native pixels.
+    pub region: Region,
+    pub native_width: u32,
+    pub native_height: u32,
+}
+
+/// What changed between two [`ProbeFrame`]s.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProbeDiff {
+    /// Bounding box of the changed cells, in native stream pixels.
+    pub bbox: Region,
+    pub changed_cells: u32,
+    pub total_cells: u32,
+}
+
+impl ProbeDiff {
+    pub fn fraction(&self) -> f64 {
+        if self.total_cells == 0 {
+            0.0
+        } else {
+            f64::from(self.changed_cells) / f64::from(self.total_cells)
+        }
+    }
+}
+
+impl ProbeFrame {
+    /// Cells that moved by more than `threshold`, as a bounding box.
+    ///
+    /// Returns `None` when the two grids do not describe the same area —
+    /// the watched window moved, or the stream was renegotiated. That is a
+    /// re-baseline, not a detection: reporting the difference between two
+    /// different patches of desktop as "activity here" would be a confident
+    /// lie about where to look.
+    pub fn diff(&self, prev: &ProbeFrame, threshold: u8) -> Option<ProbeDiff> {
+        if prev.cols != self.cols
+            || prev.rows != self.rows
+            || prev.region != self.region
+            || prev.cells.len() != self.cells.len()
+        {
+            return None;
+        }
+        let (mut min_c, mut min_r) = (u32::MAX, u32::MAX);
+        let (mut max_c, mut max_r) = (0u32, 0u32);
+        let mut changed = 0u32;
+        for (i, (now, was)) in self.cells.iter().zip(prev.cells.iter()).enumerate() {
+            if now.abs_diff(*was) <= threshold {
+                continue;
+            }
+            changed += 1;
+            let c = i as u32 % self.cols;
+            let r = i as u32 / self.cols;
+            min_c = min_c.min(c);
+            max_c = max_c.max(c);
+            min_r = min_r.min(r);
+            max_r = max_r.max(r);
+        }
+        let total = self.cols * self.rows;
+        if changed == 0 {
+            return Some(ProbeDiff {
+                bbox: Region {
+                    x: self.region.x,
+                    y: self.region.y,
+                    width: 0,
+                    height: 0,
+                },
+                changed_cells: 0,
+                total_cells: total,
+            });
+        }
+        // Cell edges back to stream pixels. Rounded outward, because a cell
+        // that changed means "something in here moved" and half a cell of
+        // slack is cheaper than a circle that clips the thing it points at.
+        let cell_w = self.region.width as f64 / self.cols as f64;
+        let cell_h = self.region.height as f64 / self.rows as f64;
+        let x0 = self.region.x + (min_c as f64 * cell_w).floor() as u32;
+        let y0 = self.region.y + (min_r as f64 * cell_h).floor() as u32;
+        let x1 = self.region.x + (((max_c + 1) as f64 * cell_w).ceil() as u32).min(self.region.width);
+        let y1 = self.region.y + (((max_r + 1) as f64 * cell_h).ceil() as u32).min(self.region.height);
+        Some(ProbeDiff {
+            bbox: Region {
+                x: x0,
+                y: y0,
+                width: x1.saturating_sub(x0).max(1),
+                height: y1.saturating_sub(y0).max(1),
+            },
+            changed_cells: changed,
+            total_cells: total,
+        })
+    }
+}
+
+/// Sample the live stream into a luma grid, without disturbing captures.
+///
+/// Reads the appsink's retained `last-sample` rather than pulling from the
+/// queue. Pulling would work equally well for the probe and quietly break
+/// `CaptureFrame`'s settle logic, which decides the screen has gone quiet by
+/// counting buffers it manages to pull — a second drainer makes every screen
+/// look quiet.
+///
+/// `Ok(None)` means there is no capture stream yet, which is a normal state
+/// for a hook created before the first screenshot, not an error.
+pub fn probe_grid(region: Option<Region>, grid: u32) -> Result<Option<ProbeFrame>> {
+    let guard = KEEPALIVE.lock().unwrap();
+    let Some(keepalive) = guard.as_ref() else {
+        return Ok(None);
+    };
+    let Some(sample) = keepalive
+        .appsink
+        .property::<Option<gst::Sample>>("last-sample")
+    else {
+        return Ok(None);
+    };
+    sample_to_probe(&sample, region, grid).map(Some)
+}
+
+/// Points sampled per cell along each axis. 4x4 is enough to notice a caret
+/// inside a 30x30-pixel cell and 60x cheaper than averaging every pixel.
+const PROBE_TAPS: u32 = 4;
+
+fn sample_to_probe(
+    sample: &gst::Sample,
+    region: Option<Region>,
+    grid: u32,
+) -> Result<ProbeFrame> {
+    let FrameGeom {
+        width,
+        height,
+        swap_rb,
+    } = frame_geom(sample)?;
+    note_stream_size(width, height);
+
+    let buffer = sample.buffer().ok_or_else(|| anyhow!("sample has no buffer"))?;
+    let map = buffer.map_readable().context("failed to map buffer")?;
+    let bytes = map.as_slice();
+    let stride = frame_stride(bytes, width, height)?;
+    let region = clamp_region(region, width, height)?;
+
+    // Square-ish cells: the grid count applies to the long edge so a tall
+    // window is not sampled with wildly anisotropic cells.
+    let grid = grid.clamp(1, 256);
+    let (cols, rows) = if region.width >= region.height {
+        (
+            grid.min(region.width),
+            (grid * region.height / region.width.max(1)).clamp(1, grid),
+        )
+    } else {
+        (
+            (grid * region.width / region.height.max(1)).clamp(1, grid),
+            grid.min(region.height),
+        )
+    };
+
+    let mut cells = Vec::with_capacity((cols * rows) as usize);
+    let cell_w = region.width as f64 / cols as f64;
+    let cell_h = region.height as f64 / rows as f64;
+    for r in 0..rows {
+        for c in 0..cols {
+            let mut acc: u32 = 0;
+            let mut taps: u32 = 0;
+            for ty in 0..PROBE_TAPS {
+                let fy = (r as f64 + (ty as f64 + 0.5) / PROBE_TAPS as f64) * cell_h;
+                let y = (region.y + fy as u32).min(region.y + region.height - 1);
+                for tx in 0..PROBE_TAPS {
+                    let fx = (c as f64 + (tx as f64 + 0.5) / PROBE_TAPS as f64) * cell_w;
+                    let x = (region.x + fx as u32).min(region.x + region.width - 1);
+                    let at = y as usize * stride + x as usize * 4;
+                    let Some(px) = bytes.get(at..at + 3) else {
+                        continue;
+                    };
+                    let (r8, g8, b8) = if swap_rb {
+                        (px[2], px[1], px[0])
+                    } else {
+                        (px[0], px[1], px[2])
+                    };
+                    // Rec.601 luma in fixed point; colour is irrelevant to
+                    // "did this move", and one channel per cell keeps the
+                    // grid small enough to diff in a few microseconds.
+                    acc += (u32::from(r8) * 54 + u32::from(g8) * 183 + u32::from(b8) * 19) >> 8;
+                    taps += 1;
+                }
+            }
+            cells.push(if taps == 0 { 0 } else { (acc / taps) as u8 });
+        }
+    }
+
+    Ok(ProbeFrame {
+        cells,
+        cols,
+        rows,
+        region,
+        native_width: width,
+        native_height: height,
     })
 }
 
@@ -828,6 +1118,94 @@ mod tests {
         // swap_rb → stored as R,G,B taken from B,G,R source bytes.
         assert_eq!(img.get_pixel(0, 0).0, [201, 101, 20]);
         assert_eq!(img.get_pixel(1, 0).0, [202, 101, 30]);
+    }
+
+    fn probe(cells: Vec<u8>, cols: u32, rows: u32) -> ProbeFrame {
+        ProbeFrame {
+            cells,
+            cols,
+            rows,
+            region: region(0, 0, cols * 10, rows * 10),
+            native_width: cols * 10,
+            native_height: rows * 10,
+        }
+    }
+
+    #[test]
+    fn a_silent_stream_says_what_the_compositor_did() {
+        // The message this replaced was "no frame from the capture stream",
+        // which sent at least one operator off restarting daemons that were
+        // working fine. Everything it now names was measured on the session
+        // that produced it.
+        let msg = NoFrame {
+            node_id: 133,
+            negotiated: (1920, 1103),
+            prerolled: false,
+        }
+        .to_string();
+        assert!(msg.contains("node 133"), "{msg}");
+        assert!(msg.contains("1920x1103"), "{msg}");
+        assert!(msg.contains("never produced a single frame"), "{msg}");
+        // The two things an operator would otherwise try first, and the
+        // reason neither helps.
+        assert!(msg.contains("already retried"), "{msg}");
+        assert!(msg.contains("Input will not start it"), "{msg}");
+        assert!(msg.contains("devkit"), "{msg}");
+    }
+
+    #[test]
+    fn a_stream_that_died_later_is_a_different_message() {
+        // Same symptom at the call site, different cause and different fix:
+        // this one was working, so the session changed under us.
+        let msg = NoFrame {
+            node_id: 7,
+            negotiated: (1920, 1080),
+            prerolled: true,
+        }
+        .to_string();
+        assert!(msg.contains("delivered frames earlier"), "{msg}");
+        assert!(!msg.contains("devkit"), "{msg}");
+    }
+
+    #[test]
+    fn a_still_screen_diffs_to_nothing() {
+        let a = probe(vec![100; 16], 4, 4);
+        let d = a.diff(&a, 10).unwrap();
+        assert_eq!(d.changed_cells, 0);
+        assert_eq!(d.fraction(), 0.0);
+    }
+
+    #[test]
+    fn noise_below_the_threshold_is_not_activity() {
+        let a = probe(vec![100; 16], 4, 4);
+        let b = probe(vec![106; 16], 4, 4);
+        assert_eq!(b.diff(&a, 10).unwrap().changed_cells, 0);
+        // ...and the same change does register once the threshold drops.
+        assert_eq!(b.diff(&a, 2).unwrap().changed_cells, 16);
+    }
+
+    #[test]
+    fn the_bbox_covers_only_the_cells_that_moved() {
+        let a = probe(vec![0; 16], 4, 4);
+        let mut cells = vec![0u8; 16];
+        cells[5] = 255; // row 1, col 1
+        cells[10] = 255; // row 2, col 2
+        let b = probe(cells, 4, 4);
+        let d = b.diff(&a, 10).unwrap();
+        assert_eq!(d.changed_cells, 2);
+        // Cells are 10x10 stream pixels here, so rows/cols 1..=2 is 10..30.
+        assert_eq!(d.bbox, region(10, 10, 20, 20));
+    }
+
+    #[test]
+    fn a_grid_of_a_different_shape_is_a_rebaseline_not_a_detection() {
+        // The watched window moved: comparing the old patch of desktop with
+        // the new one would report a huge, entirely fictional change.
+        let a = probe(vec![0; 16], 4, 4);
+        let mut b = probe(vec![0; 16], 4, 4);
+        b.region = region(500, 500, 40, 40);
+        assert!(b.diff(&a, 10).is_none());
+        assert!(probe(vec![0; 4], 2, 2).diff(&a, 10).is_none());
     }
 
     #[test]

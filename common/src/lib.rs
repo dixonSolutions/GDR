@@ -15,9 +15,14 @@
 use serde::{Deserialize, Serialize};
 use std::io;
 
+pub mod hooks;
 pub mod scopes;
 pub mod windows;
 
+pub use hooks::{
+    ActivityReport, ActivityScope, ActivitySpec, Circle, HookEvent, HookKind, HookPollResult,
+    HookSpec, HookState, HookStatus, ProcessInfo, WindowChange, WindowEventInfo, WindowHookSpec,
+};
 pub use scopes::{Scope, ScopeSet};
 pub use windows::{
     AppInfo, LogicalRect, MonitorInfo, TargetError, WindowBackend, WindowEvent, WindowInfo,
@@ -238,7 +243,60 @@ pub enum Request {
         wait_ms: u64,
     },
 
+    /// Start a standing subscription — a screen-activity or window watcher
+    /// that keeps running between requests. See [`hooks`].
+    HookCreate {
+        #[serde(flatten)]
+        spec: HookSpec,
+        #[serde(default)]
+        label: Option<String>,
+        /// Create it switched off. Default is on: an agent that asked for a
+        /// subscription wants one, not a form to fill in twice.
+        #[serde(default = "yes")]
+        enabled: bool,
+    },
+
+    /// Toggle a hook, or replace its configuration in place.
+    ///
+    /// Toggling keeps the id, the buffered events and the counters, which is
+    /// what makes "watch while I do this, then stop" cheap.
+    HookUpdate {
+        id: String,
+        #[serde(default)]
+        enabled: Option<bool>,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        spec: Option<HookSpec>,
+    },
+
+    /// Forget a hook and drop its buffered events.
+    HookRemove { id: String },
+
+    /// Every hook this token is allowed to see.
+    HookList,
+
+    /// Drain the hook journal, optionally blocking until something lands.
+    ///
+    /// `since` is the previous reply's `next_seq`. Sequence numbers are
+    /// global across hooks, so one poll drains every subscription at once;
+    /// `id` narrows it to one.
+    HookPoll {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        since: u64,
+        #[serde(default)]
+        limit: u32,
+        #[serde(default)]
+        wait_ms: u64,
+    },
+
     Ping,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Request {
@@ -259,6 +317,19 @@ impl Request {
             | Request::LaunchApp { .. }
             | Request::ListApps { .. }
             | Request::WindowEvents { .. } => Some(Scope::Window),
+            // A hook needs the scope of the thing it watches: screen
+            // activity is a (coarse) read of the screen, window events are
+            // metadata.
+            Request::HookCreate { spec, .. } => Some(spec.required_scope()),
+            // These can name hooks of either kind, and a single scope here
+            // would be either too strict or too loose. The daemon checks
+            // each hook against the connection's scopes instead — see
+            // `hook_scope_denial` in gdrd — so listing and polling return
+            // only what the token may see rather than failing outright.
+            Request::HookUpdate { .. }
+            | Request::HookRemove { .. }
+            | Request::HookList
+            | Request::HookPoll { .. } => None,
         }
     }
 }
@@ -297,6 +368,13 @@ pub enum Response {
         was_running: bool,
     },
     Apps { apps: Vec<AppInfo> },
+    /// Reply to [`Request::HookCreate`], [`Request::HookUpdate`] and
+    /// [`Request::HookRemove`] — the hook as it now stands (for a removal,
+    /// as it stood just before it went).
+    Hook { hook: Box<HookStatus> },
+    Hooks { hooks: Vec<HookStatus> },
+    /// Reply to [`Request::HookPoll`]. Boxed so the enum stays small.
+    HookEvents(Box<HookPollResult>),
     WindowEvents {
         events: Vec<WindowEvent>,
         /// Pass back as `since` on the next poll.

@@ -53,6 +53,42 @@ npm run e2e     # drives the real MCP server over stdio against the desktop
 node e2e-windows.mjs local
 ```
 
+### Subscription hooks
+
+Window hooks need a GNOME session whose shell has the `gdr-windows` extension
+*loaded*, and GNOME/Wayland scans for extensions only at session start. So a
+change under `shell-extension/` — or anything that depends on it — cannot be
+tested on the desktop you are sitting in front of without logging out. Bring
+up a session of your own instead:
+
+```bash
+./scripts/hook-test-rig.sh start      # nested headless gnome-shell + gdrd on :7339
+./scripts/hook-test-rig.sh status     # prints the HOME and the eval line
+
+# the whole hook surface, against real chromium windows nobody can see
+HOME=<rig>/home node mcp-server/e2e-hooks.mjs rig --drive
+
+./scripts/hook-test-rig.sh stop       # takes the session, gdrd and chromium with it
+```
+
+The rig is a `gnome-shell --headless --virtual-monitor 1920x1080` on its own
+D-Bus session, with the extension copied out of the working tree — so it picks
+up your edits on every start. Chromium launched into it (`hook-test-rig.sh
+chromium`) is a real managed window on a real compositor, which is what makes
+open/resize/close events worth asserting.
+
+Against any other device the same script runs the safe half — create, toggle,
+reconfigure, drain, remove — and touches no windows:
+
+```bash
+node mcp-server/e2e-hooks.mjs local
+```
+
+On a target without the shell extension it asserts that a window hook is
+*refused at creation* with the install hint, and runs the lifecycle against an
+activity hook instead. A subscription that is accepted and then silently never
+fires is the failure worth guarding against.
+
 `e2e.mjs` is the useful one after any change to capture or coordinates: it
 exercises every sizing profile, zoom, the out-of-frame click rejection, the
 `unchanged` short circuit, and `gdr_act` on both success and failure.

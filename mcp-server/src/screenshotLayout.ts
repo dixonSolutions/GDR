@@ -139,7 +139,11 @@ export class NoFrameGeometryError extends Error {
 
   constructor(key: string) {
     super(
-      `no screenshot geometry for device "${key}" — call gdr_screenshot before gdr_click/gdr_move`
+      `no screenshot geometry for device "${key}": these coordinates are in the ` +
+        `last screenshot's image space, and no screenshot has been taken. Either call ` +
+        `gdr_screenshot first, or — if you are following coordinates from gdr_windows ` +
+        `or gdr_hook_events, which report capture-stream pixels — pass space:"stream" ` +
+        `to gdr_zoom, which needs no prior screenshot.`
     );
     this.name = "NoFrameGeometryError";
     this.key = key;
@@ -169,6 +173,44 @@ export function isZoom(frame: FrameGeometry): boolean {
     frame.region.width !== frame.native_width ||
     frame.region.height !== frame.native_height
   );
+}
+
+/**
+ * Map native stream pixels back into the last screenshot's image space.
+ *
+ * The inverse of {@link toStreamCoords}, and the reason hook reports are
+ * clickable: gdrd measures screen activity in stream pixels, while
+ * `gdr_click` takes coordinates in the space of the image the agent actually
+ * looked at. Returns `null` rather than a clamped guess when the point falls
+ * outside the frame — a circle on a part of the desktop this screenshot does
+ * not show cannot be pointed at with these coordinates, and saying so is the
+ * only honest answer.
+ */
+export function toImageCoords(
+  streamX: number,
+  streamY: number,
+  frame: FrameGeometry
+): { x: number; y: number } | null {
+  if (
+    frame.native_width <= 0 ||
+    frame.native_height <= 0 ||
+    frame.image_width <= 0 ||
+    frame.image_height <= 0
+  ) {
+    return null;
+  }
+  if (!Number.isFinite(streamX) || !Number.isFinite(streamY)) return null;
+  const dx = streamX - frame.region.x;
+  const dy = streamY - frame.region.y;
+  if (dx < 0 || dy < 0 || dx > frame.region.width || dy > frame.region.height) {
+    return null;
+  }
+  const scaleX = frame.image_width / frame.region.width;
+  const scaleY = frame.image_height / frame.region.height;
+  return {
+    x: Math.round(dx * scaleX * 10) / 10,
+    y: Math.round(dy * scaleY * 10) / 10,
+  };
 }
 
 /** Clamp to inclusive stream pixel range `[0, extent - 1]`. */

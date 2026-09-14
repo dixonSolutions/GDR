@@ -1,6 +1,7 @@
 mod audit;
 mod capture;
 mod display;
+mod hooks;
 mod mutter_dbus;
 mod tls;
 mod tokens;
@@ -10,7 +11,8 @@ use anyhow::{Context, Result};
 use audit::{now_ts, AuditEvent, AuditLog};
 use base64::Engine;
 use clap::Parser;
-use common::{framing, Request, Response};
+use common::hooks::{HookKind, HookSpec};
+use common::{framing, Request, Response, ScopeSet};
 use display::SharedDisplay;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -211,6 +213,22 @@ async fn main() -> Result<()> {
             }
         };
 
+    // Subscription hooks. The registry exists even when nothing can drive
+    // it, so that "you asked for a screen hook but this gdrd runs with
+    // --no-display" is an error with a reason rather than a hook that sits
+    // there watching nothing.
+    let hook_registry: hooks::SharedHooks = Arc::new(hooks::HookRegistry::new());
+    if let Some(d) = display.clone() {
+        let reg = hook_registry.clone();
+        let plane = window_plane.clone();
+        tokio::spawn(async move { hooks::run_activity_watcher(reg, d, plane).await });
+    }
+    if let Some(plane) = window_plane.clone() {
+        let reg = hook_registry.clone();
+        let d = display.clone();
+        tokio::spawn(async move { hooks::run_window_watcher(reg, plane, d).await });
+    }
+
     let listener = TcpListener::bind(&args.bind).await?;
     tracing::info!(
         "listening on {} (tokens={}, audit={})",
@@ -227,6 +245,7 @@ async fn main() -> Result<()> {
         let display = display.clone();
         let cursor = cursor.clone();
         let window_plane = window_plane.clone();
+        let hook_registry = hook_registry.clone();
         let peer_s = peer.to_string();
 
         tokio::spawn(async move {
@@ -255,6 +274,7 @@ async fn main() -> Result<()> {
                 display.as_ref(),
                 &cursor,
                 window_plane.as_deref(),
+                &hook_registry,
             )
             .await
             {
@@ -272,6 +292,7 @@ async fn handle_connection(
     display: Option<&SharedDisplay>,
     cursor: &CursorState,
     window_plane: Option<&windows::WindowPlane>,
+    hook_registry: &hooks::SharedHooks,
 ) -> Result<()> {
     let auth_info = authenticate(&mut stream, store, audit, peer).await?;
 
@@ -333,7 +354,15 @@ async fn handle_connection(
         // saying only "WindowAction" cannot answer "what closed my editor?".
         let detail = window_audit_detail(&req);
 
-        let resp = match handle_request(req, display, cursor, window_plane).await {
+        let ctx = RequestCtx {
+            display,
+            cursor,
+            window_plane,
+            hooks: hook_registry,
+            scopes: &auth_info.scopes,
+            token_label: &auth_info.label,
+        };
+        let resp = match handle_request(req, &ctx).await {
             Ok(r) => r,
             Err(e) => Response::Error {
                 message: e.to_string(),
@@ -403,6 +432,11 @@ fn request_name(req: &Request) -> &'static str {
         Request::LaunchApp { .. } => "LaunchApp",
         Request::ListApps { .. } => "ListApps",
         Request::WindowEvents { .. } => "WindowEvents",
+        Request::HookCreate { .. } => "HookCreate",
+        Request::HookUpdate { .. } => "HookUpdate",
+        Request::HookRemove { .. } => "HookRemove",
+        Request::HookList => "HookList",
+        Request::HookPoll { .. } => "HookPoll",
         Request::Ping => "Ping",
     }
 }
@@ -421,16 +455,48 @@ fn window_audit_detail(req: &Request) -> Option<String> {
             if op.is_destructive() { " destructive" } else { "" }
         )),
         Request::LaunchApp { app_id } => Some(format!("launch {app_id}")),
+        // A standing subscription is exactly the kind of thing someone
+        // reading the audit log later wants to find: it keeps watching after
+        // the request that created it is long gone.
+        Request::HookCreate {
+            spec,
+            label,
+            enabled,
+        } => Some(format!(
+            "create {} hook{} ({}){}",
+            spec.kind(),
+            label.as_deref().map(|l| format!(" '{l}'")).unwrap_or_default(),
+            spec.describe(),
+            if *enabled { "" } else { " disabled" }
+        )),
+        Request::HookUpdate { id, enabled, .. } => Some(match enabled {
+            Some(true) => format!("enable hook {id}"),
+            Some(false) => format!("disable hook {id}"),
+            None => format!("reconfigure hook {id}"),
+        }),
+        Request::HookRemove { id } => Some(format!("remove hook {id}")),
         _ => None,
     }
 }
 
-async fn handle_request(
-    req: Request,
-    display: Option<&SharedDisplay>,
-    cursor: &CursorState,
-    window_plane: Option<&windows::WindowPlane>,
-) -> Result<Response> {
+/// Everything a request handler is allowed to touch, plus who is asking.
+///
+/// The scopes ride along because the hook requests cannot be authorized by
+/// the blanket per-request check: one `HookPoll` can name subscriptions of
+/// both kinds, so the filtering happens per hook, inside.
+struct RequestCtx<'a> {
+    display: Option<&'a SharedDisplay>,
+    cursor: &'a CursorState,
+    window_plane: Option<&'a windows::WindowPlane>,
+    hooks: &'a hooks::SharedHooks,
+    scopes: &'a ScopeSet,
+    token_label: &'a str,
+}
+
+async fn handle_request(req: Request, ctx: &RequestCtx<'_>) -> Result<Response> {
+    let display = ctx.display;
+    let cursor = ctx.cursor;
+    let window_plane = ctx.window_plane;
     match req {
         Request::Auth { .. } => Ok(Response::Error {
             message: "already authenticated".into(),
@@ -628,6 +694,82 @@ async fn handle_request(
             })
         }
 
+        Request::HookCreate {
+            spec,
+            label,
+            enabled,
+        } => {
+            hook_prerequisites(&spec, display, window_plane).await?;
+            let hook = ctx
+                .hooks
+                .create(
+                    spec,
+                    label,
+                    enabled,
+                    ctx.scopes,
+                    Some(ctx.token_label.to_string()),
+                )
+                .await?;
+            tracing::info!(
+                "hook {} created by token '{}': {}",
+                hook.id,
+                ctx.token_label,
+                hook.summary
+            );
+            Ok(Response::Hook {
+                hook: Box::new(hook),
+            })
+        }
+
+        Request::HookUpdate {
+            id,
+            enabled,
+            label,
+            spec,
+        } => {
+            if let Some(spec) = &spec {
+                hook_prerequisites(spec, display, window_plane).await?;
+            }
+            let hook = ctx
+                .hooks
+                .update(&id, enabled, label, spec, ctx.scopes)
+                .await?;
+            tracing::info!(
+                "hook {} now {} ({})",
+                hook.id,
+                if hook.enabled { "enabled" } else { "disabled" },
+                hook.summary
+            );
+            Ok(Response::Hook {
+                hook: Box::new(hook),
+            })
+        }
+
+        Request::HookRemove { id } => {
+            let hook = ctx.hooks.remove(&id, ctx.scopes).await?;
+            tracing::info!("hook {} removed", hook.id);
+            Ok(Response::Hook {
+                hook: Box::new(hook),
+            })
+        }
+
+        Request::HookList => Ok(Response::Hooks {
+            hooks: ctx.hooks.list(ctx.scopes).await,
+        }),
+
+        Request::HookPoll {
+            id,
+            since,
+            limit,
+            wait_ms,
+        } => {
+            let result = ctx
+                .hooks
+                .poll(id.as_deref(), since, limit, wait_ms, ctx.scopes)
+                .await?;
+            Ok(Response::HookEvents(Box::new(result)))
+        }
+
         Request::TypeText { text } => {
             let display = display
                 .ok_or_else(|| anyhow::anyhow!("display provider not available"))?;
@@ -652,6 +794,37 @@ async fn handle_request(
             }
             Ok(Response::Ok)
         }
+    }
+}
+
+/// Refuse a hook whose watcher could never run on this daemon.
+///
+/// Checked at creation rather than left to the watcher, because a hook that
+/// exists, says it is enabled, and reports nothing forever is the worst way
+/// to find out that gdrd was started with `--no-display` or that the window
+/// extension was never installed.
+async fn hook_prerequisites(
+    spec: &HookSpec,
+    display: Option<&SharedDisplay>,
+    window_plane: Option<&windows::WindowPlane>,
+) -> Result<()> {
+    match spec.kind() {
+        HookKind::Activity if display.is_none() => Err(anyhow::anyhow!(
+            "this gdrd runs with --no-display, so there is no capture stream to watch \
+             for activity. Window hooks still work; they are metadata only."
+        )),
+        HookKind::Window => {
+            let plane = require_window_plane(window_plane)?;
+            // Ask the extension, don't just check that a bus exists: a
+            // subscription that is accepted and then silently never fires is
+            // precisely the failure this check is here to prevent, and the
+            // extension is missing on every target until its first logout.
+            if !plane.available().await {
+                return Err(anyhow::anyhow!("{}", windows::INSTALL_HINT));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 

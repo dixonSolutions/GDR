@@ -42,7 +42,18 @@ impl DisplayProvider {
         }
         tracing::warn!("capture stream came up dead — restarting Mutter session");
         provider.shutdown().await;
-        Self::try_start(connector, size).await
+        let provider = Self::try_start(connector, size).await?;
+        if !capture::keepalive_prerolled() {
+            // Both attempts produced nothing. Say so here rather than logging
+            // "display provider ready" and letting the operator discover it
+            // as an unexplained capture error minutes later — which is
+            // exactly how this reads in the wild: a startup log that looks
+            // clean, then every screenshot failing for no stated reason.
+            tracing::warn!(
+                "capture stream is silent after a session restart — the compositor is                  not painting this monitor, so screenshots will fail until it is.                  Common cause: a --devkit / mdk session whose viewer is not showing                  the monitor, or a virtual monitor with no consumer."
+            );
+        }
+        Ok(provider)
     }
 
     async fn try_start(connector: Option<&str>, size: CaptureSize) -> Result<Self> {
@@ -174,8 +185,15 @@ impl DisplayManager {
             )
             .await
             .context("start display provider")?;
+            // "ready" is a claim, so make it one that survives inspection:
+            // a provider whose stream never prerolled is attached, not ready.
             tracing::info!(
-                "display provider ready (virtual={}, node={}, {}x{})",
+                "display provider {} (virtual={}, node={}, {}x{})",
+                if capture::keepalive_prerolled() {
+                    "ready"
+                } else {
+                    "attached but producing no frames"
+                },
                 provider.is_virtual(),
                 provider.node_id(),
                 provider.size().width,

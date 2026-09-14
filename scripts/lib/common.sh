@@ -78,6 +78,14 @@ ensure_cargo() {
 build_binaries() {
   ensure_cargo
   echo "==> Building gdr + gdrd (release)..."
+  # A Homebrew pkg-config ahead of /usr/bin on PATH only searches the brew
+  # prefix, so the gstreamer .pc files the distro installed go unseen and the
+  # gstreamer-sys build script fails. Point the pkg-config crate at the
+  # system tool unless the caller already chose one.
+  if [ -z "${PKG_CONFIG:-}" ] && [ -x /usr/bin/pkg-config ] \
+     && [ "$(command -v pkg-config 2>/dev/null)" != /usr/bin/pkg-config ]; then
+    export PKG_CONFIG=/usr/bin/pkg-config
+  fi
   (cd "$ROOT" && cargo build --release -p gdr -p gdrd)
   [ -x "$ROOT/target/release/gdr" ] || die "gdr binary missing"
   [ -x "$ROOT/target/release/gdrd" ] || die "gdrd binary missing"

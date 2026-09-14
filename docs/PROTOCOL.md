@@ -34,6 +34,11 @@ The TypeScript mirror is [`mcp-server/src/gdrClient.ts`](../mcp-server/src/gdrCl
 | `LaunchApp` | `app_id: string` | `window` |
 | `ListApps` | `filter: string \| null` | `window` |
 | `WindowEvents` | `since: u64`, `limit: u32`, `wait_ms: u64` | `window` |
+| `HookCreate` | `kind: activity\|window` + that kind's fields (flattened), `label`, `enabled` | `screenshot` (activity) / `window` (window) |
+| `HookUpdate` | `id`, `enabled?`, `label?`, `spec?` | per hook (see below) |
+| `HookRemove` | `id` | per hook |
+| `HookList` | — | per hook |
+| `HookPoll` | `id?`, `since: u64`, `limit: u32`, `wait_ms: u64` | per hook |
 | `Ping` | — | none (auth only) |
 
 The `Window*` requests need the `gdr-windows` GNOME Shell extension on the
@@ -107,6 +112,9 @@ Sizing notes:
 | `AppLaunched` | `app_id`, `name`, `was_running` (false = we started it) |
 | `Apps` | `apps[]` — `app_id`, `name`, `windows`, `running` |
 | `WindowEvents` | `events[]`, `next_seq`, `dropped` (fell behind the ring), `reset` (shell restarted) |
+| `Hook` | `hook: HookStatus` — reply to create/update/remove (for a removal, as it stood just before it went) |
+| `Hooks` | `hooks[]` — only those the token's scopes cover |
+| `HookEvents` | `events[]`, `next_seq`, `dropped`, `hooks[]` (live state, so an empty drain can say which kind of empty) |
 | `Error` | `message: string` (including permission denied) |
 
 ## Auth + scopes
@@ -114,6 +122,13 @@ Sizing notes:
 After `AuthOk`, the server remembers that connection’s `ScopeSet`.
 Each later request calls `Request::required_scope()`; missing scope →
 `Error { message: "permission denied: ..." }` and an audit `denied` event.
+
+**Hooks are the exception to one-scope-per-request.** `HookUpdate`,
+`HookRemove`, `HookList` and `HookPoll` can name subscriptions of either kind,
+so a single `required_scope()` would be either too strict or too loose. They
+return `None` from that check and the daemon filters *per hook* instead:
+listing and polling return only what the token's scopes cover, and naming a
+hook it may not see is a permission error. See [HOOKS.md](./HOOKS.md).
 
 **Revocation semantics (current):** revoke blocks *new* connections.
 Already-open sessions keep working until disconnect (SSH-like).

@@ -176,6 +176,15 @@ enum Command {
         wait_ms: u64,
     },
 
+    /// Standing subscriptions: watch screen activity or window lifecycle.
+    Hook {
+        #[command(subcommand)]
+        cmd: HookCmd,
+    },
+
+    /// Shorthand for `gdr hook list`.
+    Hooks,
+
     /// List installed apps, or launch/raise one.
     App {
         /// Desktop-file id to launch. Omit to list.
@@ -192,6 +201,114 @@ enum Command {
         /// Host profile name (default_host if omitted).
         #[arg(value_name = "HOST")]
         name: Option<String>,
+    },
+}
+
+/// Subscription hooks. `screen` and `window` create one; the rest manage
+/// what is already there.
+#[derive(Subcommand, Debug, Clone)]
+enum HookCmd {
+    /// Watch the screen — or one window — for activity, reported as a circle.
+    Screen {
+        /// Watch only this window (tracks it as it moves).
+        #[arg(long)]
+        id: Option<u64>,
+        #[arg(long)]
+        app_id: Option<String>,
+        #[arg(long)]
+        wm_class: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        /// Watch a fixed rectangle of stream pixels: x,y,width,height.
+        #[arg(long, value_name = "X,Y,W,H")]
+        region: Option<String>,
+        /// Quiet period before a burst is reported, in ms.
+        #[arg(long, default_value_t = common::hooks::ACTIVITY_BUFFER_MS)]
+        buffer_ms: u64,
+        /// Never report more often than this, in ms. 0 = off. For regions
+        /// that repaint on a timer, where every repaint is its own burst.
+        #[arg(long, default_value_t = 0)]
+        min_interval_ms: u64,
+        #[arg(long, default_value_t = common::hooks::ACTIVITY_POLL_MS)]
+        poll_ms: u64,
+        /// Report a still-moving burst anyway after this long. 0 disables.
+        #[arg(long, default_value_t = common::hooks::ACTIVITY_MAX_BURST_MS)]
+        max_burst_ms: u64,
+        /// Per-cell luma delta that counts as change (1-255).
+        #[arg(long, default_value_t = 12)]
+        threshold: u8,
+        /// Cells that must change before a sample counts as activity.
+        #[arg(long, default_value_t = 1)]
+        min_cells: u32,
+        /// Diff grid resolution along the long edge.
+        #[arg(long, default_value_t = 64)]
+        grid: u32,
+        /// Ignore bursts whose circle is bigger than this radius, in px.
+        #[arg(long, default_value_t = 0)]
+        max_radius: u32,
+        #[arg(long)]
+        label: Option<String>,
+        /// Create it switched off.
+        #[arg(long)]
+        off: bool,
+    },
+
+    /// Watch windows opening, closing, resizing and more.
+    Window {
+        /// Comma-separated: opened,closed,resized,moved,retitled,focused,
+        /// minimized,unminimized,workspace
+        #[arg(long, default_value = "opened,closed,resized")]
+        events: String,
+        /// Watch only windows matching this selector.
+        #[arg(long)]
+        id: Option<u64>,
+        #[arg(long)]
+        app_id: Option<String>,
+        #[arg(long)]
+        wm_class: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        /// Quiet period before a geometry change is reported, in ms.
+        #[arg(long, default_value_t = common::hooks::WINDOW_BUFFER_MS)]
+        buffer_ms: u64,
+        #[arg(long, default_value_t = common::hooks::WINDOW_POLL_MS)]
+        poll_ms: u64,
+        #[arg(long, default_value_t = common::hooks::WINDOW_MAX_BURST_MS)]
+        max_burst_ms: u64,
+        /// Include docks, panels and notification popups.
+        #[arg(long)]
+        all: bool,
+        /// Skip the /proc lookup for the owning process.
+        #[arg(long)]
+        no_process: bool,
+        #[arg(long)]
+        label: Option<String>,
+        /// Create it switched off.
+        #[arg(long)]
+        off: bool,
+    },
+
+    /// Show every hook this token may see.
+    List,
+    /// Switch one on.
+    On { id: String },
+    /// Switch one off, keeping its config and buffered events.
+    Off { id: String },
+    /// Forget one, dropping its buffered events.
+    Remove { id: String },
+    /// Drain the hook journal.
+    Events {
+        /// Only this hook. Omit to drain every hook at once.
+        #[arg(long)]
+        id: Option<String>,
+        /// Resume after this sequence number.
+        #[arg(long, default_value_t = 0)]
+        since: u64,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+        /// Block up to this many ms for the first event.
+        #[arg(long, default_value_t = 0)]
+        wait_ms: u64,
     },
 }
 
@@ -465,6 +582,8 @@ async fn run_window_command(
                 filter: filter.clone(),
             },
         },
+        Command::Hooks => Request::HookList,
+        Command::Hook { cmd } => hook_request(cmd)?,
         _ => return Ok(None),
     };
 
@@ -474,6 +593,142 @@ async fn run_window_command(
         std::process::exit(1);
     }
     Ok(Some(()))
+}
+
+/// Turn a `gdr hook …` invocation into one protocol request.
+fn hook_request(cmd: &HookCmd) -> Result<Request> {
+    use common::hooks::{ActivitySpec, HookSpec, WindowHookSpec};
+
+    fn target(
+        id: Option<u64>,
+        app_id: &Option<String>,
+        wm_class: &Option<String>,
+        title: &Option<String>,
+    ) -> Option<common::WindowTarget> {
+        if id.is_none() && app_id.is_none() && wm_class.is_none() && title.is_none() {
+            return None;
+        }
+        Some(common::WindowTarget {
+            id,
+            app_id: app_id.clone(),
+            wm_class: wm_class.clone(),
+            title: title.clone(),
+            pid: None,
+            focused: false,
+        })
+    }
+
+    Ok(match cmd {
+        HookCmd::Screen {
+            id,
+            app_id,
+            wm_class,
+            title,
+            region,
+            buffer_ms,
+            min_interval_ms,
+            poll_ms,
+            max_burst_ms,
+            threshold,
+            min_cells,
+            grid,
+            max_radius,
+            label,
+            off,
+        } => {
+            let region = match region {
+                None => None,
+                Some(spec) => {
+                    let nums: Vec<u32> = spec
+                        .split(',')
+                        .map(|p| p.trim().parse::<u32>())
+                        .collect::<Result<_, _>>()
+                        .context("--region takes four numbers: x,y,width,height")?;
+                    if nums.len() != 4 {
+                        anyhow::bail!("--region takes four numbers: x,y,width,height");
+                    }
+                    Some(common::Region {
+                        x: nums[0],
+                        y: nums[1],
+                        width: nums[2],
+                        height: nums[3],
+                    })
+                }
+            };
+            Request::HookCreate {
+                spec: HookSpec::Activity(ActivitySpec {
+                    target: target(*id, app_id, wm_class, title),
+                    region,
+                    buffer_ms: *buffer_ms,
+                    min_interval_ms: *min_interval_ms,
+                    max_burst_ms: *max_burst_ms,
+                    poll_ms: *poll_ms,
+                    threshold: *threshold,
+                    min_cells: *min_cells,
+                    grid: *grid,
+                    max_radius: *max_radius,
+                }),
+                label: label.clone(),
+                enabled: !off,
+            }
+        }
+        HookCmd::Window {
+            events,
+            id,
+            app_id,
+            wm_class,
+            title,
+            buffer_ms,
+            poll_ms,
+            max_burst_ms,
+            all,
+            no_process,
+            label,
+            off,
+        } => Request::HookCreate {
+            spec: HookSpec::Window(WindowHookSpec {
+                target: target(*id, app_id, wm_class, title),
+                events: events
+                    .split(',')
+                    .map(|e| e.trim().to_string())
+                    .filter(|e| !e.is_empty())
+                    .collect(),
+                buffer_ms: *buffer_ms,
+                max_burst_ms: *max_burst_ms,
+                poll_ms: *poll_ms,
+                include_skip_taskbar: *all,
+                geometry_threshold: 2,
+                include_process: !no_process,
+            }),
+            label: label.clone(),
+            enabled: !off,
+        },
+        HookCmd::List => Request::HookList,
+        HookCmd::On { id } => Request::HookUpdate {
+            id: id.clone(),
+            enabled: Some(true),
+            label: None,
+            spec: None,
+        },
+        HookCmd::Off { id } => Request::HookUpdate {
+            id: id.clone(),
+            enabled: Some(false),
+            label: None,
+            spec: None,
+        },
+        HookCmd::Remove { id } => Request::HookRemove { id: id.clone() },
+        HookCmd::Events {
+            id,
+            since,
+            limit,
+            wait_ms,
+        } => Request::HookPoll {
+            id: id.clone(),
+            since: *since,
+            limit: *limit,
+            wait_ms: *wait_ms,
+        },
+    })
 }
 
 fn parse_window_op(
@@ -629,9 +884,89 @@ fn print_window_response(cmd: &Command, resp: &Response, json: bool) -> Result<(
                 if *reset { " (sequence restarted)" } else { "" }
             );
         }
+        Response::Hook { hook } => print_hooks(std::slice::from_ref(hook.as_ref())),
+        Response::Hooks { hooks } => print_hooks(hooks),
+        Response::HookEvents(result) => {
+            for e in &result.events {
+                let what = match (&e.activity, &e.window) {
+                    (Some(a), _) => format!(
+                        "circle ({:.0},{:.0}) r={:.0}  {}x{} box  {}",
+                        a.circle.x,
+                        a.circle.y,
+                        a.circle.radius,
+                        a.bbox.width,
+                        a.bbox.height,
+                        if a.settled { "settled" } else { "STILL MOVING" }
+                    ),
+                    (_, Some(w)) => format!(
+                        "{:<30} {}x{}+{}+{}  pid {}{}",
+                        w.title.as_deref().unwrap_or(w.app_id.as_deref().unwrap_or("?")),
+                        w.frame_rect.width,
+                        w.frame_rect.height,
+                        w.frame_rect.x,
+                        w.frame_rect.y,
+                        w.pid,
+                        w.process
+                            .as_ref()
+                            .and_then(|p| p.comm.clone())
+                            .map(|c| format!(" ({c})"))
+                            .unwrap_or_default()
+                    ),
+                    _ => String::new(),
+                };
+                println!(
+                    "  #{:<5} {} {:<12} {:<14} {}",
+                    e.seq, e.at, e.hook_id, e.kind, what
+                );
+            }
+            println!(
+                "{} events, next_seq={}{}",
+                result.events.len(),
+                result.next_seq,
+                if result.dropped {
+                    " (older events aged out — poll more often)"
+                } else {
+                    ""
+                }
+            );
+            print_hooks(&result.hooks);
+        }
         other => println!("{other:?}"),
     }
     Ok(())
+}
+
+fn print_hooks(hooks: &[common::HookStatus]) {
+    if hooks.is_empty() {
+        println!("no hooks");
+        return;
+    }
+    for h in hooks {
+        println!(
+            "  {:<12} {:<8} {:<9} scope={:<10} {}{}",
+            h.id,
+            if h.enabled { "on" } else { "off" },
+            h.state.as_str(),
+            h.required_scope,
+            h.summary,
+            h.label
+                .as_deref()
+                .map(|l| format!("  '{l}'"))
+                .unwrap_or_default()
+        );
+        if let Some(err) = &h.last_error {
+            println!("               ! {err}");
+        }
+        println!(
+            "               {} events emitted, {} buffered{}",
+            h.events_emitted,
+            h.buffered,
+            h.last_event_at
+                .as_deref()
+                .map(|t| format!(", last {t}"))
+                .unwrap_or_default()
+        );
+    }
 }
 
 fn response_to_result<'a>(
@@ -1249,6 +1584,8 @@ async fn main() -> Result<()> {
         | Command::Windows { .. }
         | Command::Window { .. }
         | Command::WindowEvents { .. }
+        | Command::Hook { .. }
+        | Command::Hooks
         | Command::App { .. } => unreachable!(),
     };
 

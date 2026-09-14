@@ -82,7 +82,7 @@ Claude Desktop’s config when found.
 | Tool | Args | Notes |
 |---|---|---|
 | `gdr_screenshot` / `gnome_screenshot` | `host?`, `profile?`, `settle?`, `skip_unchanged?`, `layout?` | Sizes for the model's token budget, returns geometry JSON + image. `settle` off by default |
-| `gdr_zoom` | `host?`, `x`, `y`, `width`, `height`, `settle?` | Crop at **native** resolution. Use for anything under ~20px |
+| `gdr_zoom` | `host?`, `x`, `y`, `width`, `height`, `space?`, `settle?` | Crop at **native** resolution. Use for anything under ~20px. `space:"stream"` takes capture-stream coordinates (what hooks report) and needs no prior screenshot; the default `"image"` takes the last screenshot's pixels |
 | `gdr_act` | `host?`, `steps[]`, `expect_change?`, `profile?`, `settle?`, `screenshot?` | Actions **and** the resulting screenshot in one round trip. Settles by default |
 | `gdr_click` / `gnome_click` | `host?`, `x`, `y`, `button?`, `clicks?` | `x,y` in latest screenshot image space; remapped to stream pixels. Requires a prior screenshot. `clicks=2` = double-click |
 | `gdr_double_click` | `host?`, `x`, `y`, `button?` | shorthand |
@@ -99,6 +99,7 @@ Claude Desktop’s config when found.
 | `gdr_device_remove` | `dev` | Remove profile by id/label/alias |
 | `gdr_device_default` | `dev` | Set `default_host` |
 | `gdr_get_password` | `host?`/`dev?`, `kind: sudo\|user` | see below |
+| `gdr_hook_screen` / `gdr_hook_window` / `gdr_hooks` / `gdr_hook_events` | see [Subscription hooks](#subscription-hooks) | Standing watches on screen activity and window lifecycle |
 
 ### Window tools
 
@@ -129,6 +130,35 @@ an arbitrary pick.
 
 Every control tool accepts **`host`** or **`dev`** (same meaning): device id,
 label (`"home computer"`), or alias.
+
+### Subscription hooks
+
+Standing watches gdrd runs between requests, instead of the agent
+screenshotting in a loop. Full story — buffer time, why activity is a circle,
+what an enabled activity hook costs — in [HOOKS.md](./HOOKS.md).
+
+| Tool | Key args | Notes |
+|---|---|---|
+| `gdr_hook_screen` | selector or `region?`, `buffer_ms?`, `poll_ms?`, `threshold?`, `max_radius?`, `id?` | Watch the screen, a rectangle, or one window. Reports a circle. Needs `screenshot` |
+| `gdr_hook_window` | `events[]`, selector, `buffer_ms?`, `poll_ms?`, `include_process?`, `id?` | opened/closed/resized/moved/retitled/… with title, size and owning process. Needs `window` |
+| `gdr_hooks` | `action: list\|enable\|disable\|remove`, `id?` | The toggle. Disabling keeps config and buffered events |
+| `gdr_hook_events` | `id?`, `since`, `limit?`, `wait_ms?` | One cursor drains every hook. `wait_ms>0` blocks instead of polling |
+
+Pass `id=` to the two creation tools to reconfigure an existing hook in place
+rather than ending up with two watching the same thing.
+
+Activity circles come back in capture-stream pixels **and**, when a screenshot
+for that device exists, in that image's coordinate space — the one
+`gdr_click` takes:
+
+```json
+"circle": { "x": 1465, "y": 612, "radius": 93, "space": "stream" },
+"circle_in_last_screenshot": { "x": 1068, "y": 446, "radius": 68 }
+```
+
+An enabled activity hook holds the desktop capture open (see
+[Privacy / idle disconnect](#privacy--idle-disconnect)) — switch it off when
+you are done watching.
 
 ### Flexible keyboard: `gdr_hotkey` + `gdr_input`
 
@@ -266,6 +296,13 @@ socket open. gdrd itself tears down physical ScreenCast after
 
 Prefer a **single** `gdr` MCP entry (not `--per-device`) so you do not
 run three idle Node processes.
+
+**An enabled activity hook is the deliberate exception.** It holds the capture
+session open for as long as it is switched on, because a watcher that the idle
+teardown kills is not watching. That means the desktop is being streamed
+continuously — visible to whoever is at the machine — until the hook is
+disabled or removed. Window hooks do not touch the capture stream at all; they
+are metadata only. See [HOOKS.md](./HOOKS.md).
 
 ## Locked screen
 
