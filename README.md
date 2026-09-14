@@ -46,6 +46,24 @@ gdr pkg info
 
 See [docs/CONFIG.md](./docs/CONFIG.md) and [docs/TOKENS.md](./docs/TOKENS.md).
 
+## Windows, not just pixels
+
+`gdrd` can also enumerate windows, act on a specific one (even minimized, on
+another workspace, or not running yet), watch them open and close, and hold a
+pinned default window so you stop repeating the selector.
+
+```bash
+./scripts/install-window-extension.sh --dev desktop   # then log out and back in
+gdr --host desktop windows
+gdr --host desktop window activate --title "Inbox"
+gdr --host desktop window-events --wait-ms 5000
+```
+
+This needs a small GNOME Shell extension, because GNOME 50 refuses
+`org.gnome.Shell.Introspect.GetWindows` to everything but the desktop portal
+and Mutter's screencast API only ever knew about pixels.
+[docs/WINDOWS.md](./docs/WINDOWS.md) has the full story.
+
 ## Two trust boundaries
 
 | Plane | Channel | For |

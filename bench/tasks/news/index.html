@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Task 5 — Summarise the front page</title>
+    <link rel="stylesheet" href="/task.css" />
+    <style>
+      .masthead {
+        text-align: center;
+        padding: var(--space-4) 0 var(--space-3);
+        border-bottom: 3px double var(--text);
+        margin-bottom: var(--space-4);
+      }
+      .masthead h2 {
+        font-family: Georgia, "Times New Roman", serif;
+        font-size: 40px;
+        letter-spacing: 0.04em;
+        margin: 0;
+      }
+      .masthead .dateline {
+        font-size: 13px;
+        color: var(--text-muted);
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      .story {
+        font-family: Georgia, "Times New Roman", serif;
+        font-size: 15px;
+        columns: 2;
+        column-gap: var(--space-5);
+        margin-bottom: var(--space-5);
+      }
+      .story h3 {
+        font-size: 22px;
+        margin: 0 0 var(--space-2);
+        column-span: all;
+        font-family: system-ui, sans-serif;
+        letter-spacing: -0.01em;
+      }
+      .story .kicker {
+        column-span: all;
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--accent);
+        font-family: system-ui, sans-serif;
+        font-weight: 700;
+        margin-bottom: var(--space-1);
+      }
+      .story p {
+        margin: 0 0 var(--space-3);
+      }
+      #composer {
+        position: sticky;
+        bottom: 0;
+        background: var(--surface);
+        border-top: 2px solid var(--accent);
+      }
+    </style>
+  </head>
+  <body>
+    <header class="task-bar">
+      <div>
+        <h1>Task 5 — Summarise the front page</h1>
+        <p class="goal">
+          Read all four stories, then write a summary naming every fact listed in the brief.
+        </p>
+      </div>
+      <div class="status" id="status">0 / 4 facts</div>
+    </header>
+
+    <main>
+      <div class="card">
+        <h2>Editor's brief</h2>
+        <p>Your summary must state, in your own words, all four of the following:</p>
+        <ul>
+          <li>the number of berths the new harbour terminal will have</li>
+          <li>the surname of the engineer leading the seawall project</li>
+          <li>the year the observatory was founded</li>
+          <li>the name of the line that will close for repairs</li>
+        </ul>
+        <p class="muted">Write at least 35 words. The facts are scattered across the four stories.</p>
+      </div>
+
+      <div class="card">
+        <div class="masthead">
+          <div class="dateline">Vellmar Herald · Thursday edition</div>
+          <h2>THE VELLMAR HERALD</h2>
+        </div>
+
+        <div class="story">
+          <div class="kicker">Waterfront</div>
+          <h3>Harbour terminal cleared for construction</h3>
+          <p>
+            The port authority has approved the long-delayed passenger terminal on the east quay,
+            ending a planning dispute that ran for most of a decade. Work begins in the spring.
+          </p>
+          <p>
+            The completed terminal will operate <strong>nine berths</strong>, three more than the
+            structure it replaces, and is expected to absorb the overflow that has forced smaller
+            vessels to moor at the fishing pier since the storm damage of two winters ago.
+          </p>
+          <p>
+            Objections centred on the loss of the open quayside walk. The authority has promised a
+            replacement promenade along the northern edge, though no date has been set for it.
+          </p>
+        </div>
+
+        <div class="story">
+          <div class="kicker">Coastal defence</div>
+          <h3>Seawall works to run through winter</h3>
+          <p>
+            Reinforcement of the western seawall will continue past the original completion date,
+            with the contractor citing an unexpectedly soft clay layer beneath the foundation.
+          </p>
+          <p>
+            The project engineer, <strong>Halloran</strong>, told the council that the revised
+            method involves driving piles a further four metres and that the additional cost falls
+            within the contingency already agreed.
+          </p>
+          <p>
+            Residents of the western terraces have complained about night working. The contractor
+            says piling is restricted to daylight hours and that the night activity is limited to
+            concrete curing checks.
+          </p>
+        </div>
+
+        <div class="story">
+          <div class="kicker">Science</div>
+          <h3>Observatory marks a quiet anniversary</h3>
+          <p>
+            The hill observatory, founded in <strong>1887</strong>, has passed another year with
+            almost no public notice, which its director suggests is exactly how the institution
+            prefers things.
+          </p>
+          <p>
+            Its original refractor is still in service, though the dome mechanism was replaced
+            after a failure left the shutter frozen open through a week of rain. The instrument
+            survived; the floor did not.
+          </p>
+          <p>
+            A public viewing evening is planned once the replacement flooring is laid, with dates to
+            be announced through the usual channels.
+          </p>
+        </div>
+
+        <div class="story">
+          <div class="kicker">Transport</div>
+          <h3>Repairs to shut a commuter route</h3>
+          <p>
+            Track renewal will close the <strong>Harbour Line</strong> for eleven weeks from the
+            end of the month, with a replacement bus service running at roughly half the usual
+            frequency.
+          </p>
+          <p>
+            The operator has advised passengers travelling to the shipyards to use the northern
+            route and change at the Salt Market, adding around twenty minutes to a typical journey.
+          </p>
+          <p>
+            Season ticket holders will receive a partial refund, applied automatically, though the
+            operator has not said when the credit will appear.
+          </p>
+        </div>
+      </div>
+
+      <div class="card" id="composer">
+        <h2>Your summary</h2>
+        <textarea id="summary" placeholder="Write your summary here…"></textarea>
+        <div style="margin-top: var(--space-3); display: flex; gap: var(--space-2); align-items: center">
+          <button id="submit">Submit summary</button>
+          <span class="muted" id="wordcount">0 words</span>
+        </div>
+      </div>
+
+      <div class="done-banner"></div>
+      <p class="muted" id="tally"></p>
+    </main>
+
+    <script type="module">
+      import { start, complete, progress, publish } from "/task.js";
+
+      const TASK = "news";
+
+      /**
+       * Each fact accepts several spellings so the score reflects whether the
+       * agent found the information, not whether it happened to phrase things
+       * the way the marker expected.
+       */
+      const FACTS = [
+        { id: "berths", label: "nine berths", patterns: [/\bnine\b/i, /\b9\b/] },
+        { id: "engineer", label: "engineer Halloran", patterns: [/hallor[ae]n/i] },
+        { id: "founded", label: "observatory founded 1887", patterns: [/\b1887\b/] },
+        { id: "line", label: "Harbour Line closure", patterns: [/harbou?r\s+line/i] },
+      ];
+      const MIN_WORDS = 35;
+
+      const area = document.getElementById("summary");
+      const statusEl = document.getElementById("status");
+      const wordEl = document.getElementById("wordcount");
+      let submitted = false;
+
+      const wordsIn = (t) => t.trim().split(/\s+/).filter(Boolean).length;
+      const hits = (t) => FACTS.filter((f) => f.patterns.some((p) => p.test(t)));
+
+      area.addEventListener("input", () => {
+        const text = area.value;
+        const found = hits(text);
+        statusEl.textContent = `${found.length} / ${FACTS.length} facts`;
+        wordEl.textContent = `${wordsIn(text)} words`;
+        publish({
+          task: TASK,
+          words: wordsIn(text),
+          facts_found: found.map((f) => f.id),
+          submitted,
+        });
+      });
+
+      document.getElementById("submit").addEventListener("click", () => {
+        if (submitted) return;
+        const text = area.value;
+        const words = wordsIn(text);
+        const found = hits(text);
+
+        if (words < MIN_WORDS) {
+          document.getElementById("tally").textContent =
+            `Too short — ${words} words, need at least ${MIN_WORDS}.`;
+          progress(TASK, { event: "too_short", words });
+          return;
+        }
+
+        submitted = true;
+        const score = found.length / FACTS.length;
+        const missing = FACTS.filter((f) => !found.includes(f)).map((f) => f.label);
+        document.getElementById("tally").textContent = missing.length
+          ? `Missing: ${missing.join("; ")}`
+          : "All required facts present.";
+        complete(TASK, {
+          success: found.length === FACTS.length,
+          score,
+          detail: { words, found: found.map((f) => f.id), missing },
+        });
+        publish({ task: TASK, words, facts_found: found.map((f) => f.id), submitted: true });
+      });
+
+      start(TASK, { facts: FACTS.length, min_words: MIN_WORDS });
+    </script>
+  </body>
+</html>

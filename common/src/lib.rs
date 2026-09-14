@@ -16,13 +16,108 @@ use serde::{Deserialize, Serialize};
 use std::io;
 
 pub mod scopes;
+pub mod windows;
 
 pub use scopes::{Scope, ScopeSet};
+pub use windows::{
+    AppInfo, LogicalRect, MonitorInfo, TargetError, WindowBackend, WindowEvent, WindowInfo,
+    WindowOp, WindowTarget,
+};
 
 pub const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024; // 64 MiB, generous for a full screenshot as base64
 
 /// Default TCP port for gdrd.
 pub const DEFAULT_PORT: u16 = 7337;
+
+/// Encoding for [`Request::CaptureFrame`].
+///
+/// JPEG is the default for agent traffic: identical visual-token cost (image
+/// billing is on decoded pixel dimensions, not bytes) but a much smaller
+/// payload. PNG stays for lossless/debug captures.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageFormat {
+    #[default]
+    Png,
+    Jpeg,
+}
+
+impl ImageFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImageFormat::Png => "png",
+            ImageFormat::Jpeg => "jpeg",
+        }
+    }
+
+    pub fn mime(self) -> &'static str {
+        match self {
+            ImageFormat::Png => "image/png",
+            ImageFormat::Jpeg => "image/jpeg",
+        }
+    }
+}
+
+/// Rectangle in native stream pixels (the coordinate space Mutter's
+/// `NotifyPointerMotionAbsolute` uses).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Region {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Wait for the compositor to stop emitting damage before grabbing a frame.
+///
+/// Mutter's ScreenCast stream is emit-on-damage, so "no new buffer for
+/// `quiet_ms`" means the UI has finished painting. `timeout_ms` bounds
+/// screens that never go quiet (spinners, video, blinking carets).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Settle {
+    pub quiet_ms: u64,
+    pub timeout_ms: u64,
+}
+
+impl Default for Settle {
+    fn default() -> Self {
+        Self {
+            quiet_ms: 120,
+            // Bounded by the Doherty threshold. Damage is tracked per stream,
+            // not per region, so one blinking caret anywhere on the desktop
+            // keeps every capture "busy" and no amount of patience will find a
+            // quiet window — measured on a working desktop, the frame changed
+            // in 11 of 11 samples 200 ms apart. Timing out is not a failure:
+            // the newest frame is still returned, flagged `settled: false`.
+            timeout_ms: 400,
+        }
+    }
+}
+
+/// A captured, already-sized, already-encoded frame.
+///
+/// gdrd crops, resizes and encodes in one pass from the raw PipeWire buffer
+/// so controllers never decode-and-re-encode what the daemon just produced.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Frame {
+    /// Base64 image bytes. Empty when `unchanged` is true.
+    pub data_base64: String,
+    pub format: ImageFormat,
+    /// Full desktop size, regardless of any crop.
+    pub native_width: u32,
+    pub native_height: u32,
+    /// Portion of the desktop this image covers, in native pixels.
+    pub region: Region,
+    /// Encoded image size (`region` after downscale).
+    pub image_width: u32,
+    pub image_height: u32,
+    /// Content hash; pass back as `if_none_match` to skip identical frames.
+    pub hash: String,
+    pub unchanged: bool,
+    /// False when a requested settle hit its timeout (screen never went quiet).
+    pub settled: bool,
+    pub capture_ms: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
@@ -32,7 +127,50 @@ pub enum Request {
 
     /// Take a single screenshot of the given monitor (or the primary one
     /// if `connector` is None) and return it as base64-encoded PNG.
+    ///
+    /// Legacy full-resolution path. Prefer [`Request::CaptureFrame`], which
+    /// sizes and encodes server-side in a single pass.
     Screenshot { connector: Option<String> },
+
+    /// Capture with server-side crop, downscale, encode and change detection.
+    ///
+    /// All of these are optional; the default is a native-size PNG, i.e.
+    /// equivalent to `Screenshot`.
+    CaptureFrame {
+        /// Crop in native pixels, applied before any downscale. Clamped to
+        /// the frame; an empty intersection is an error, not a silent full
+        /// frame (a wrong crop must not look like a working screenshot).
+        #[serde(default)]
+        region: Option<Region>,
+        /// Downscale to fit this box, aspect preserved. Never upscales.
+        #[serde(default)]
+        max_width: Option<u32>,
+        #[serde(default)]
+        max_height: Option<u32>,
+        /// Cap on the longer edge, in pixels.
+        #[serde(default)]
+        max_long_edge: Option<u32>,
+        /// Vision-model tiling budget: fit within this many `patch_size`
+        /// cells, where an image costs `ceil(w/p) * ceil(h/p)`. Applied
+        /// server-side because it depends on the native aspect ratio, which
+        /// only the daemon knows before the first capture.
+        #[serde(default)]
+        max_patches: Option<u32>,
+        /// Patch cell size for `max_patches`. Defaults to 28.
+        #[serde(default)]
+        patch_size: Option<u32>,
+        #[serde(default)]
+        format: ImageFormat,
+        /// JPEG quality 1..=100. Ignored for PNG.
+        #[serde(default)]
+        quality: Option<u8>,
+        #[serde(default)]
+        settle: Option<Settle>,
+        /// Return `unchanged: true` with no image when the frame hashes to
+        /// this value.
+        #[serde(default)]
+        if_none_match: Option<String>,
+    },
 
     /// Absolute mouse move, in real pixel coordinates of the target
     /// stream (server maps these directly to Mutter's coordinate space).
@@ -56,6 +194,50 @@ pub enum Request {
     /// the first move/click from a controller.
     GetCursor,
 
+    /// Enumerate every managed window, with logical *and* capture-stream
+    /// geometry. Needs the `gdr-windows` shell extension on the target.
+    ListWindows {
+        /// Include dock/panel/notification windows, which are normally noise.
+        #[serde(default)]
+        include_skip_taskbar: bool,
+    },
+
+    /// Activate / minimize / move / close one window.
+    ///
+    /// `Activate` is the interesting one: it is what makes a window that is
+    /// minimized, buried, or on another workspace visible to `CaptureFrame`,
+    /// which streams the composited screen and cannot see a window that is
+    /// not on it.
+    WindowAction {
+        target: WindowTarget,
+        #[serde(flatten)]
+        op: WindowOp,
+    },
+
+    /// Start an installed app, or raise it if it is already running. The
+    /// path to "act on a window that is not currently open at all".
+    LaunchApp { app_id: String },
+
+    /// Installed apps, optionally filtered by a substring of id or name.
+    ListApps {
+        #[serde(default)]
+        filter: Option<String>,
+    },
+
+    /// Poll the window open/close/focus journal.
+    ///
+    /// Pass the previous reply's `next_seq` as `since`. `wait_ms > 0` holds
+    /// the request open until something happens or the wait elapses, so a
+    /// watcher costs one connection instead of a busy loop.
+    WindowEvents {
+        #[serde(default)]
+        since: u64,
+        #[serde(default)]
+        limit: u32,
+        #[serde(default)]
+        wait_ms: u64,
+    },
+
     Ping,
 }
 
@@ -65,13 +247,18 @@ impl Request {
     pub fn required_scope(&self) -> Option<Scope> {
         match self {
             Request::Auth { .. } | Request::Ping => None,
-            Request::Screenshot { .. } => Some(Scope::Screenshot),
+            Request::Screenshot { .. } | Request::CaptureFrame { .. } => Some(Scope::Screenshot),
             Request::MouseMove { .. }
             | Request::MouseButton { .. }
             | Request::MouseScroll { .. }
             | Request::GetCursor => Some(Scope::Mouse),
             Request::KeyEvent { .. } => Some(Scope::Keyboard),
             Request::TypeText { .. } => Some(Scope::Type),
+            Request::ListWindows { .. }
+            | Request::WindowAction { .. }
+            | Request::LaunchApp { .. }
+            | Request::ListApps { .. }
+            | Request::WindowEvents { .. } => Some(Scope::Window),
         }
     }
 }
@@ -87,10 +274,57 @@ pub enum Response {
     AuthOkScoped { scopes: Vec<String> },
     AuthFailed,
     Screenshot { png_base64: String },
+    /// Reply to [`Request::CaptureFrame`]. Boxed so the enum stays small.
+    Frame(Box<Frame>),
     /// Last known absolute pointer position (see `Request::GetCursor`).
     CursorPosition { x: f64, y: f64, known: bool },
+    /// Reply to [`Request::ListWindows`]. Boxed so the enum stays small.
+    Windows(Box<WindowList>),
+    /// Reply to [`Request::WindowAction`], carrying the window's state
+    /// *after* the compositor had its say — a move can be clamped and a
+    /// close can be refused, and the caller needs to see that.
+    WindowActed {
+        action: String,
+        window: Option<Box<WindowInfo>>,
+        #[serde(default)]
+        detail: Option<String>,
+    },
+    AppLaunched {
+        app_id: String,
+        name: Option<String>,
+        /// False means we started it; true means it was already running and
+        /// we raised it.
+        was_running: bool,
+    },
+    Apps { apps: Vec<AppInfo> },
+    WindowEvents {
+        events: Vec<WindowEvent>,
+        /// Pass back as `since` on the next poll.
+        next_seq: u64,
+        /// The caller fell behind the extension's ring and lost events.
+        dropped: bool,
+        /// The compositor (and its sequence numbers) restarted under us.
+        reset: bool,
+    },
     Pong,
     Error { message: String },
+}
+
+/// Payload of [`Response::Windows`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WindowList {
+    pub backend: WindowBackend,
+    pub windows: Vec<WindowInfo>,
+    pub monitors: Vec<MonitorInfo>,
+    pub focus_window: Option<u64>,
+    pub active_workspace: i32,
+    pub n_workspaces: i32,
+    /// Connector gdrd is streaming. Only windows on this monitor have a
+    /// `stream_region`, and only they can be screenshotted.
+    pub capture_connector: Option<String>,
+    /// Event sequence at the moment of the listing; a fine `since` for a
+    /// first `WindowEvents` poll.
+    pub seq: u64,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -264,6 +498,54 @@ mod tests {
             Some(Scope::Type)
         );
         assert_eq!(Request::Ping.required_scope(), None);
+        // The window plane is its own scope: it exposes titles, not pixels,
+        // so a screenshot-only token must not reach it and vice versa.
+        assert_eq!(
+            Request::ListWindows {
+                include_skip_taskbar: false
+            }
+            .required_scope(),
+            Some(Scope::Window)
+        );
+        assert_eq!(
+            Request::LaunchApp {
+                app_id: "x.desktop".into()
+            }
+            .required_scope(),
+            Some(Scope::Window)
+        );
+        let screenshot_only = ScopeSet::parse_list("screenshot").unwrap();
+        assert!(!screenshot_only.allows(
+            Request::ListWindows {
+                include_skip_taskbar: false
+            }
+            .required_scope()
+        ));
+    }
+
+    #[test]
+    fn window_action_wire_shape_flattens_the_op() {
+        // The TS client builds `{type, target, action, ...args}` in one
+        // object literal; a nested op here would break it silently.
+        let req = Request::WindowAction {
+            target: WindowTarget {
+                title: Some("notes".into()),
+                ..Default::default()
+            },
+            op: WindowOp::MoveResize {
+                x: 10,
+                y: 20,
+                width: 800,
+                height: 600,
+            },
+        };
+        let v: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["type"], "WindowAction");
+        assert_eq!(v["action"], "move_resize");
+        assert_eq!(v["width"], 800);
+        assert_eq!(v["target"]["title"], "notes");
+        let back: Request = serde_json::from_value(v).unwrap();
+        assert_eq!(back, req);
     }
 
     #[test]

@@ -5,7 +5,12 @@
 - Multiple named tokens per host (you / agent / script).
 - Server stores **hashes only** (SHA-256; tokens are high-entropy, not passwords).
 - Optional expiry (`never` / `30d` / `12h` / `15m`).
-- Permission scopes: `screenshot`, `mouse`, `keyboard`, `type`, or `all`.
+- Permission scopes: `screenshot`, `mouse`, `keyboard`, `type`, `window`, or `all`.
+  `window` covers listing windows, watching them open/close, acting on one,
+  and launching apps — titles, not pixels, so it is orthogonal to
+  `screenshot`. Tokens minted as `all` (everything `deploy.sh` creates) gain
+  it automatically; explicit scope lists from before the window plane need it
+  added. See [WINDOWS.md](./WINDOWS.md).
 - Management over **SSH admin plane**, not the live TLS protocol.
 
 ## Why admin-plane management?

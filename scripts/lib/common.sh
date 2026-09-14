@@ -416,24 +416,160 @@ list_remote_ssh_targets() {
   ' "$cfg"
 }
 
+# Per-target SSH login auth for this process.
+# GDR_SSH_AUTH[target]=key|pass   GDR_SSH_LOGIN_PASS[target]=password when pass
+declare -gA GDR_SSH_AUTH=()
+declare -gA GDR_SSH_LOGIN_PASS=()
+
+lookup_user_password_for_ssh() {
+  local want="$1" cfg
+  cfg="$(controller_config_path)"
+  [ -f "$cfg" ] || return 0
+  node -e '
+    const fs = require("fs");
+    const want = process.argv[1];
+    let cfg;
+    try { cfg = JSON.parse(fs.readFileSync(process.argv[2], "utf8")); }
+    catch (_) { process.exit(0); }
+    for (const h of Object.values(cfg.hosts || {})) {
+      if (!h || typeof h !== "object") continue;
+      if ((h.ssh || "").trim() !== want) continue;
+      const p = h.user_password == null ? "" : String(h.user_password);
+      if (p) process.stdout.write(p);
+      break;
+    }
+  ' "$want" "$cfg"
+}
+
+ssh_key_ok() {
+  ssh -n -o BatchMode=yes -o ConnectTimeout=15 "$1" true >/dev/null 2>&1
+}
+
+# ssh/scp with a login password (sshpass). Never use BatchMode — it disables passwords.
+ssh_pass_cmd() {
+  local target="$1" pass="$2"; shift 2
+  command -v sshpass >/dev/null 2>&1 \
+    || { echo "    error: sshpass required for SSH password auth" >&2; return 1; }
+  SSHPASS="$pass" sshpass -e ssh -n \
+    -o ConnectTimeout=15 \
+    -o PreferredAuthentications=password \
+    -o PubkeyAuthentication=no \
+    -o NumberOfPasswordPrompts=1 \
+    "$target" "$@"
+}
+
+scp_pass_cmd() {
+  local pass="$1"; shift
+  command -v sshpass >/dev/null 2>&1 \
+    || { echo "    error: sshpass required for SSH password auth" >&2; return 1; }
+  SSHPASS="$pass" sshpass -e scp \
+    -o ConnectTimeout=15 \
+    -o PreferredAuthentications=password \
+    -o PubkeyAuthentication=no \
+    -o NumberOfPasswordPrompts=1 \
+    "$@"
+}
+
+prompt_ssh_login_password() {
+  local target="$1" pass
+  # /dev/tty: works inside while-read loops and when stdin is a pipe.
+  if [ ! -r /dev/tty ]; then
+    return 1
+  fi
+  read -r -s -p "SSH password for $target: " pass </dev/tty || return 1
+  printf '\n' >/dev/tty
+  printf '%s' "$pass"
+}
+
+# Establish how we talk to $target for the rest of this process.
+# Order: cached → key → user_password in config → GDR_SSH_PASSWORD → interactive prompt.
+ensure_ssh_access() {
+  local target="$1" pass=""
+  case "${GDR_SSH_AUTH[$target]:-}" in
+    key|pass) return 0 ;;
+    fail) return 1 ;;
+  esac
+
+  if ssh_key_ok "$target"; then
+    GDR_SSH_AUTH[$target]=key
+    return 0
+  fi
+
+  pass="$(lookup_user_password_for_ssh "$target" || true)"
+  if [ -z "$pass" ] && [ -n "${GDR_SSH_PASSWORD:-}" ]; then
+    pass="$GDR_SSH_PASSWORD"
+  fi
+  if [ -z "$pass" ]; then
+    if [ ! -r /dev/tty ]; then
+      echo "    skip: SSH key failed for $target (non-interactive; set user_password or GDR_SSH_PASSWORD)" >&2
+      GDR_SSH_AUTH[$target]=fail
+      return 1
+    fi
+    echo "    SSH publickey failed for $target — enter login password (empty skips):" >&2
+    pass="$(prompt_ssh_login_password "$target" || true)"
+  fi
+  if [ -z "$pass" ]; then
+    echo "    skip: no SSH login password for $target" >&2
+    GDR_SSH_AUTH[$target]=fail
+    return 1
+  fi
+  if ssh_pass_cmd "$target" "$pass" true >/dev/null 2>&1; then
+    GDR_SSH_AUTH[$target]=pass
+    GDR_SSH_LOGIN_PASS[$target]="$pass"
+    return 0
+  fi
+  echo "    skip: SSH password auth failed for $target" >&2
+  GDR_SSH_AUTH[$target]=fail
+  return 1
+}
+
+# -n: never read local stdin (critical inside `while read` loops that feed host lists).
 ssh_remote() {
   local target="$1"; shift
-  ssh -o BatchMode=yes -o ConnectTimeout=15 "$target" "$@"
+  ensure_ssh_access "$target" || return 1
+  if [ "${GDR_SSH_AUTH[$target]}" = "pass" ]; then
+    ssh_pass_cmd "$target" "${GDR_SSH_LOGIN_PASS[$target]}" "$@"
+  else
+    ssh -n -o BatchMode=yes -o ConnectTimeout=15 "$target" "$@"
+  fi
+}
+
+# scp local paths → "$target:remote..." (same auth as ssh_remote).
+scp_to_remote() {
+  local target="$1"; shift
+  ensure_ssh_access "$target" || return 1
+  if [ "${GDR_SSH_AUTH[$target]}" = "pass" ]; then
+    scp_pass_cmd "${GDR_SSH_LOGIN_PASS[$target]}" "$@"
+  else
+    scp -o BatchMode=yes -o ConnectTimeout=15 "$@"
+  fi
 }
 
 # Run a remote command with sudo -S. Password via arg (not echoed); not argv on remote.
 ssh_remote_sudo() {
   local target="$1" pass="$2"; shift 2
   local cmd="$*"
+  ensure_ssh_access "$target" || return 1
   if [ -n "$pass" ]; then
+    # stdin is the sudo password pipe — do not use -n here.
     # shellcheck disable=SC2029
-    printf '%s\n' "$pass" | ssh -o BatchMode=yes -o ConnectTimeout=15 "$target" \
-      "sudo -S -p '' bash -lc $(printf '%q' "$cmd")"
+    if [ "${GDR_SSH_AUTH[$target]}" = "pass" ]; then
+      command -v sshpass >/dev/null 2>&1 \
+        || { echo "    error: sshpass required for SSH password auth" >&2; return 1; }
+      printf '%s\n' "$pass" | SSHPASS="${GDR_SSH_LOGIN_PASS[$target]}" sshpass -e ssh \
+        -o ConnectTimeout=15 \
+        -o PreferredAuthentications=password \
+        -o PubkeyAuthentication=no \
+        -o NumberOfPasswordPrompts=1 \
+        "$target" "sudo -S -p '' bash -lc $(printf '%q' "$cmd")"
+    else
+      printf '%s\n' "$pass" | ssh -o BatchMode=yes -o ConnectTimeout=15 "$target" \
+        "sudo -S -p '' bash -lc $(printf '%q' "$cmd")"
+    fi
   else
     # Passwordless sudo, or fail clearly.
     # shellcheck disable=SC2029
-    ssh -o BatchMode=yes -o ConnectTimeout=15 "$target" \
-      "sudo -n bash -lc $(printf '%q' "$cmd")"
+    ssh_remote "$target" "sudo -n bash -lc $(printf '%q' "$cmd")"
   fi
 }
 
@@ -445,7 +581,7 @@ push_remote_binaries() {
   [ -x "$gdrd" ] || die "missing $gdrd"
   echo "    pushing binaries to $target..."
   ssh_remote "$target" 'mkdir -p /tmp/gdr-bin-update'
-  scp -o BatchMode=yes -o ConnectTimeout=15 \
+  scp_to_remote "$target" \
     "$gdrd" "$gdrbin" "$ROOT/packaging/gdr-mcp.sh" \
     "$target:/tmp/gdr-bin-update/"
   if ssh_remote "$target" 'test -x /usr/bin/gdrd || test -d /usr/share/gdr'; then
@@ -463,52 +599,76 @@ push_remote_binaries() {
   fi
 }
 
+# Return 2 for soft-skip (unreachable SSH), 1 for hard failure.
+ssh_unreachable_err() {
+  printf '%s' "$1" | grep -qiE \
+    'Permission denied|Could not resolve|Connection (timed out|refused)|No route to host'
+}
+
 install_remote_package_file() {
   local target="$1" pass="$2" pkg="$3"
-  local base remote_pm remote_pkg ssh_err
+  local base remote_pm remote_pkg ssh_err ssh_ec err_file
   base="$(basename "$pkg")"
   remote_pkg="/tmp/$base"
 
+  if ! ensure_ssh_access "$target"; then
+    return 2
+  fi
+
+  err_file="$(mktemp /tmp/gdr-ssh-err.XXXXXX)"
+
+  # Do not use `local ssh_ec=$?` — `local` itself resets $? to 0.
   set +e
   remote_pm="$(ssh_remote "$target" \
     'if command -v apt-get >/dev/null 2>&1; then echo apt;
      elif command -v dnf >/dev/null 2>&1; then echo dnf;
-     else echo unknown; fi' 2>/tmp/gdr-ssh-err.$$)"
-  local ssh_ec=$?
+     else echo unknown; fi' 2>"$err_file")"
+  ssh_ec=$?
   set -e
+  ssh_err="$(cat "$err_file" 2>/dev/null || true)"
+  rm -f "$err_file"
+
   if [ "$ssh_ec" -ne 0 ]; then
-    ssh_err="$(cat /tmp/gdr-ssh-err.$$ 2>/dev/null || true)"
-    rm -f /tmp/gdr-ssh-err.$$
-    if printf '%s' "$ssh_err" | grep -qiE 'Permission denied|Could not resolve|Connection (timed out|refused)'; then
+    if ssh_unreachable_err "$ssh_err"; then
       echo "    skip: SSH unreachable ($target) — fix keys/host and retry" >&2
-      echo "      $ssh_err" | head -2 >&2
+      printf '%s\n' "$ssh_err" | head -2 | sed 's/^/      /' >&2
       return 2
     fi
-    echo "    error: ssh failed ($target): $ssh_err" >&2
+    echo "    error: ssh failed ($target)" >&2
+    printf '%s\n' "$ssh_err" | head -3 | sed 's/^/      /' >&2
     return 1
   fi
-  rm -f /tmp/gdr-ssh-err.$$
 
   case "$pkg" in
     *.deb)
       if [ "$remote_pm" != apt ]; then
-        echo "    warn: $target is $remote_pm but package is .deb — binary fallback"
+        echo "    warn: $target is '${remote_pm:-unknown}' but package is .deb — binary fallback"
+        set +e
         push_remote_binaries "$target" "$pass"
-        return 0
+        ssh_ec=$?
+        set -e
+        [ "$ssh_ec" -eq 0 ] && return 0
+        echo "    skip: binary fallback failed for $target" >&2
+        return 2
       fi
       echo "    installing $base via apt..."
-      scp -o BatchMode=yes -o ConnectTimeout=15 "$pkg" "$target:$remote_pkg"
+      scp_to_remote "$target" "$pkg" "$target:$remote_pkg"
       ssh_remote_sudo "$target" "$pass" \
         "dpkg -i $(printf '%q' "$remote_pkg") || apt-get install -f -y; rm -f $(printf '%q' "$remote_pkg")"
       ;;
     *.rpm)
       if [ "$remote_pm" != dnf ]; then
-        echo "    warn: $target is $remote_pm but package is .rpm — binary fallback"
+        echo "    warn: $target is '${remote_pm:-unknown}' but package is .rpm — binary fallback"
+        set +e
         push_remote_binaries "$target" "$pass"
-        return 0
+        ssh_ec=$?
+        set -e
+        [ "$ssh_ec" -eq 0 ] && return 0
+        echo "    skip: binary fallback failed for $target" >&2
+        return 2
       fi
       echo "    installing $base via dnf..."
-      scp -o BatchMode=yes -o ConnectTimeout=15 "$pkg" "$target:$remote_pkg"
+      scp_to_remote "$target" "$pkg" "$target:$remote_pkg"
       ssh_remote_sudo "$target" "$pass" \
         "dnf install -y $(printf '%q' "$remote_pkg"); rm -f $(printf '%q' "$remote_pkg")"
       ;;
@@ -565,7 +725,8 @@ update_remote_packages() {
   fi
 
   echo "==> Updating remotes from $(controller_config_path)..."
-  while IFS=$'\t' read -r id target pass; do
+  # Read host list on fd 3 so nested ssh never steals lines from stdin.
+  while IFS=$'\t' read -r id target pass <&3; do
     [ -n "$target" ] || continue
     if [ "$mode" = "id" ]; then
       want=0
@@ -600,7 +761,7 @@ update_remote_packages() {
       continue
     fi
     echo "    ok: $id package + gdrd restart"
-  done < <(list_remote_ssh_targets)
+  done 3< <(list_remote_ssh_targets)
 
   if [ "$count" -eq 0 ]; then
     echo "    (no matching SSH remotes)"
@@ -777,8 +938,22 @@ EOS
   )
 
   echo "    git pull — $label ($target)"
+  if ! ensure_ssh_access "$target"; then
+    return 0
+  fi
   set +e
-  out="$(ssh -o BatchMode=yes -o ConnectTimeout=15 "$target" "bash -s" <<<"$script" 2>&1)"
+  if [ "${GDR_SSH_AUTH[$target]}" = "pass" ]; then
+    command -v sshpass >/dev/null 2>&1 \
+      || { echo "    error: sshpass required for SSH password auth" >&2; return 1; }
+    out="$(SSHPASS="${GDR_SSH_LOGIN_PASS[$target]}" sshpass -e ssh \
+      -o ConnectTimeout=15 \
+      -o PreferredAuthentications=password \
+      -o PubkeyAuthentication=no \
+      -o NumberOfPasswordPrompts=1 \
+      "$target" "bash -s" <<<"$script" 2>&1)"
+  else
+    out="$(ssh -o BatchMode=yes -o ConnectTimeout=15 "$target" "bash -s" <<<"$script" 2>&1)"
+  fi
   ec=$?
   set -e
   printf '%s\n' "$out" | sed 's/^/      /'

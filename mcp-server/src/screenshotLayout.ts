@@ -1,47 +1,136 @@
 /**
- * Post-process gdrd PNG screenshots into an agent-friendly click layout.
+ * Screenshot sizing policy and click-coordinate remapping.
  *
- * Capture stays native on the wire; MCP owns geometry metadata, optional
- * downscale (fit inside 1440×900), and remapping click/move coords from
- * image space back to Mutter stream pixels.
+ * gdrd crops, resizes and encodes in a single pass from the raw PipeWire
+ * buffer, so this module no longer touches pixels. Its job is to decide
+ * *what to ask for* (the sizing profile) and to map coordinates the agent
+ * read off an image back to Mutter stream pixels.
  *
- * Assumption (enforced in gdrd, not here): `native_width`/`native_height`
- * from the PNG IHDR equal the PipeWire buffer size for the ScreenCast
- * stream node passed to `NotifyPointerMotionAbsolute`. Today gdrd pulls
- * PNG frames from the same keepalive appsink bound to that stream, so the
- * sizes match by construction. If screenshot and stream ever diverge
- * (portal path, multi-monitor stitch vs single-stream node), remapping
- * stays internally consistent but is absolutely wrong — systematic drift.
- *
- * Frame geometry is only replaced on the next `gdr_screenshot` for a
- * device key. Resize / workspace / monitor changes are not observed here;
- * agents must re-screenshot before clicking after those.
+ * The one invariant that matters: **agents always give coordinates in the
+ * space of the most recent image they were shown for that device.** Full
+ * screenshot or zoom, the rule does not change; the crop origin and scale
+ * are folded into the remap here. A second coordinate system would be the
+ * fastest way to reintroduce the drift this file exists to prevent.
  */
 
-import sharp from "sharp";
+import type { Frame, Region } from "./gdrClient.js";
 
 export type LayoutMode = "raw" | "agent";
 
-/** OpenAI CUA-recommended desktop band; also under common Claude long-edge budgets. */
-export const AGENT_MAX_WIDTH = 1440;
-export const AGENT_MAX_HEIGHT = 900;
+/**
+ * Vision models bill images in 28×28 patches: an image costs
+ * `ceil(w/28) * ceil(h/28)` visual tokens. Past the per-tier cap the model
+ * API **silently downscales server-side**, and coordinates then come back
+ * in a space we never saw — systematic click drift.
+ *
+ * Sizing in pixels cannot see that cliff. The previous 1440×900 fit box
+ * looked conservative but cost 52×33 = 1716 tokens against a 1568 cap on a
+ * 16:10 panel; 16:9 sources landed at 1440×810 = 1508 and stayed under it
+ * purely by luck of aspect ratio, which is why this only broke on some
+ * machines. The budget is now expressed in patches and applied by gdrd,
+ * which is the only place the native aspect ratio is known.
+ */
+export const PATCH = 28;
+
+export interface SizingProfile {
+  /** Patch budget, or null when the target has no such cap. */
+  maxPatches: number | null;
+  /** Long-edge cap in pixels, or null. */
+  maxLongEdge: number | null;
+  /** Explicit pixel box, for targets that specify one. */
+  maxWidth?: number;
+  maxHeight?: number;
+  describe: string;
+}
+
+/**
+ * Per-call because the vendors genuinely disagree: Anthropic enforces a
+ * patch budget, OpenAI removed its resize ceiling and asks for fidelity.
+ */
+export const SIZING_PROFILES = {
+  claude: {
+    maxPatches: 1568,
+    maxLongEdge: 1568,
+    describe: "Claude standard tier (≤1568 visual tokens)",
+  },
+  "claude-hires": {
+    maxPatches: 4784,
+    maxLongEdge: 2576,
+    describe: "Claude 4.7+ high-resolution tier (≤4784 visual tokens)",
+  },
+  openai: {
+    maxPatches: null,
+    maxLongEdge: null,
+    maxWidth: 1440,
+    maxHeight: 900,
+    describe: "OpenAI computer-use viewport (1440×900, no patch cap)",
+  },
+  /**
+   * For agents whose image viewer caps images at 1024px on the long edge.
+   *
+   * Such a viewer silently resizes anything larger, so the picture the agent
+   * measures against stops matching the click space it was told to use — the
+   * same silent-downscale trap as an over-budget capture, arriving from the
+   * client side instead. Staying at or under 1024 means what the agent sees is
+   * exactly what it clicks.
+   */
+  compact: {
+    maxPatches: null,
+    maxLongEdge: 1024,
+    describe: "≤1024px long edge, for viewers that resize anything larger",
+  },
+  raw: {
+    maxPatches: null,
+    maxLongEdge: null,
+    describe: "native resolution, 1:1",
+  },
+} as const satisfies Record<string, SizingProfile>;
+
+export type ProfileName = keyof typeof SIZING_PROFILES;
+export const DEFAULT_PROFILE: ProfileName = "claude";
+export const PROFILE_NAMES = Object.keys(SIZING_PROFILES) as [ProfileName, ...ProfileName[]];
+
+/** Visual-token cost of an image, as billed. */
+export function visualTokens(width: number, height: number): number {
+  return Math.ceil(width / PATCH) * Math.ceil(height / PATCH);
+}
+
+/** Sizing constraints to send with a `CaptureFrame` request. */
+export function profileRequest(profile: ProfileName = DEFAULT_PROFILE): {
+  max_width?: number;
+  max_height?: number;
+  max_long_edge?: number;
+  max_patches?: number;
+  patch_size?: number;
+} {
+  const p: SizingProfile = SIZING_PROFILES[profile];
+  const out: ReturnType<typeof profileRequest> = {};
+  if (p.maxWidth) out.max_width = p.maxWidth;
+  if (p.maxHeight) out.max_height = p.maxHeight;
+  if (p.maxLongEdge) out.max_long_edge = p.maxLongEdge;
+  if (p.maxPatches) {
+    out.max_patches = p.maxPatches;
+    out.patch_size = PATCH;
+  }
+  return out;
+}
+
+/** `layout` is the older, coarser knob; map it onto a profile. */
+export function profileForLayout(
+  layout: LayoutMode | undefined,
+  profile: ProfileName | undefined
+): ProfileName {
+  if (profile) return profile;
+  return layout === "raw" ? "raw" : DEFAULT_PROFILE;
+}
 
 export interface FrameGeometry {
   native_width: number;
   native_height: number;
   image_width: number;
   image_height: number;
-  layout: LayoutMode;
-  click_space: "image" | "native";
-}
-
-export interface ScreenshotMeta extends FrameGeometry {
-  note: string;
-}
-
-export interface AppliedLayout {
-  png_base64: string;
-  meta: ScreenshotMeta;
+  /** Portion of the desktop this image shows, in native pixels. */
+  region: Region;
 }
 
 /** Thrown when click/move remapping runs before any screenshot for that device. */
@@ -57,46 +146,29 @@ export class NoFrameGeometryError extends Error {
   }
 }
 
-const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-
-/** Read width/height from PNG IHDR (no full decode). */
-export function parsePngSize(buf: Buffer): { width: number; height: number } {
-  if (buf.length < 24) {
-    throw new Error("PNG too short to contain IHDR");
+/** Thrown when coordinates fall outside the image they claim to come from. */
+export class OutOfFrameError extends Error {
+  constructor(x: number, y: number, frame: FrameGeometry) {
+    super(
+      `(${x}, ${y}) is outside the last image for this device ` +
+        `(${frame.image_width}×${frame.image_height}). ` +
+        (isZoom(frame)
+          ? "That image was a zoom into " +
+            `${frame.region.width}×${frame.region.height}+${frame.region.x},${frame.region.y}; ` +
+            "coordinates must be read off the zoom, or take a full gdr_screenshot first."
+          : "Take a fresh gdr_screenshot and re-read the coordinates.")
+    );
+    this.name = "OutOfFrameError";
   }
-  if (!buf.subarray(0, 8).equals(PNG_SIG)) {
-    throw new Error("not a PNG (bad signature)");
-  }
-  const chunkLen = buf.readUInt32BE(8);
-  const chunkType = buf.subarray(12, 16).toString("ascii");
-  if (chunkType !== "IHDR" || chunkLen < 8) {
-    throw new Error(`expected IHDR chunk, got ${chunkType}`);
-  }
-  const width = buf.readUInt32BE(16);
-  const height = buf.readUInt32BE(20);
-  if (width === 0 || height === 0) {
-    throw new Error(`invalid PNG size ${width}x${height}`);
-  }
-  return { width, height };
 }
 
-/** Largest integer size that fits inside maxW×maxH preserving aspect ratio. */
-export function fitInside(
-  width: number,
-  height: number,
-  maxW: number = AGENT_MAX_WIDTH,
-  maxH: number = AGENT_MAX_HEIGHT
-): { width: number; height: number } {
-  if (width <= maxW && height <= maxH) {
-    return { width, height };
-  }
-  const scale = Math.min(maxW / width, maxH / height);
-  let w = Math.max(1, Math.round(width * scale));
-  let h = Math.max(1, Math.round(height * scale));
-  // Guard rounding that can push one edge over the box by 1px.
-  if (w > maxW) w = maxW;
-  if (h > maxH) h = maxH;
-  return { width: w, height: h };
+export function isZoom(frame: FrameGeometry): boolean {
+  return (
+    frame.region.x !== 0 ||
+    frame.region.y !== 0 ||
+    frame.region.width !== frame.native_width ||
+    frame.region.height !== frame.native_height
+  );
 }
 
 /** Clamp to inclusive stream pixel range `[0, extent - 1]`. */
@@ -109,18 +181,18 @@ function clampStreamAxis(v: number, extent: number): number {
 
 /**
  * Map image-space (x,y) to native stream pixels.
- * Requires a frame (no silent native fallback). Identity when sizes match.
- * Always clamps into `[0, native_* - 1]` so edge/off-by-one detector boxes
- * cannot produce out-of-range Mutter absolute coords.
+ *
+ * Composes the crop origin with the downscale factor, so full screenshots
+ * and zooms use the same rule. Coordinates outside the image are rejected
+ * rather than extrapolated: an agent passing full-desktop coordinates
+ * against a zoom frame is a real and silent failure mode, and guessing
+ * would put the click somewhere plausible but wrong.
  */
 export function toStreamCoords(
   x: number,
   y: number,
-  frame: Pick<
-    FrameGeometry,
-    "native_width" | "native_height" | "image_width" | "image_height" | "click_space"
-  >
-): { stream_x: number; stream_y: number; click_space: "image" | "native" } {
+  frame: FrameGeometry
+): { stream_x: number; stream_y: number } {
   if (
     frame.native_width <= 0 ||
     frame.native_height <= 0 ||
@@ -132,123 +204,112 @@ export function toStreamCoords(
         `image=${frame.image_width}x${frame.image_height}`
     );
   }
-
-  let stream_x: number;
-  let stream_y: number;
-  if (
-    frame.image_width === frame.native_width &&
-    frame.image_height === frame.native_height
-  ) {
-    stream_x = x;
-    stream_y = y;
-  } else {
-    stream_x = (x * frame.native_width) / frame.image_width;
-    stream_y = (y * frame.native_height) / frame.image_height;
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    throw new Error(`non-finite coordinates (${x}, ${y})`);
+  }
+  // Half a pixel of slack for detectors that report an exclusive edge.
+  if (x < -0.5 || y < -0.5 || x > frame.image_width + 0.5 || y > frame.image_height + 0.5) {
+    throw new OutOfFrameError(x, y, frame);
   }
 
+  const scaleX = frame.region.width / frame.image_width;
+  const scaleY = frame.region.height / frame.image_height;
   return {
-    stream_x: clampStreamAxis(stream_x, frame.native_width),
-    stream_y: clampStreamAxis(stream_y, frame.native_height),
-    click_space: frame.click_space,
+    stream_x: clampStreamAxis(frame.region.x + x * scaleX, frame.native_width),
+    stream_y: clampStreamAxis(frame.region.y + y * scaleY, frame.native_height),
   };
 }
 
-function geometryNote(layout: LayoutMode, clickSpace: "image" | "native"): string {
-  if (layout === "raw" || clickSpace === "native") {
-    return "gdr_click/gdr_move x,y are native stream pixels (1:1 with this image)";
-  }
+export interface ScreenshotMeta extends FrameGeometry {
+  profile: ProfileName;
+  format: string;
+  visual_tokens: number;
+  /** False when the screen never went quiet before the settle timeout. */
+  settled: boolean;
+  capture_ms: number;
+  zoom?: number;
+  note: string;
+}
+
+function note(frame: FrameGeometry, settled: boolean): string {
+  const base = isZoom(frame)
+    ? `ZOOM: this image shows ${frame.region.width}×${frame.region.height} of the desktop at ` +
+      `+${frame.region.x},${frame.region.y}. gdr_click/gdr_move x,y are in this zoom's ` +
+      `${frame.image_width}×${frame.image_height} space — to click elsewhere, take a full gdr_screenshot first`
+    : `gdr_click/gdr_move x,y are in image_width×image_height for this device ` +
+      `until the next gdr_screenshot (re-screenshot after resize/workspace/monitor change)`;
+  if (settled) return base;
+  // Fires for benign reasons too — a spinner or video anywhere on the
+  // desktop keeps the whole stream busy, since damage is not tracked per
+  // region. Stated as information, not an alarm: the frame is still the
+  // newest one available, and treating this as an error would train agents
+  // to ignore it.
   return (
-    "gdr_click/gdr_move x,y are in image_width×image_height for this device " +
-    "until the next gdr_screenshot (re-screenshot after resize/workspace/monitor change)"
+    `${base}. Note: something on screen was still animating, so this is the ` +
+    `newest frame rather than a settled one — re-capture if it looks mid-transition`
   );
 }
 
-/**
- * Apply layout to a base64 PNG from gdrd.
- * `raw` — pass-through; `agent` — downscale to fit 1440×900 when larger.
- */
-export async function applyScreenshotLayout(
-  png_base64: string,
-  layout: LayoutMode = "agent"
-): Promise<AppliedLayout> {
-  const buf = Buffer.from(png_base64, "base64");
-  const native = parsePngSize(buf);
-
-  if (layout === "raw") {
-    const meta: ScreenshotMeta = {
-      native_width: native.width,
-      native_height: native.height,
-      image_width: native.width,
-      image_height: native.height,
-      layout: "raw",
-      click_space: "native",
-      note: geometryNote("raw", "native"),
-    };
-    return { png_base64, meta };
-  }
-
-  const fitted = fitInside(native.width, native.height);
-  if (fitted.width === native.width && fitted.height === native.height) {
-    const meta: ScreenshotMeta = {
-      native_width: native.width,
-      native_height: native.height,
-      image_width: native.width,
-      image_height: native.height,
-      layout: "agent",
-      click_space: "native",
-      note: geometryNote("agent", "native"),
-    };
-    return { png_base64, meta };
-  }
-
-  const out = await sharp(buf)
-    .resize(fitted.width, fitted.height, { fit: "fill" })
-    .png()
-    .toBuffer();
-
-  const meta: ScreenshotMeta = {
-    native_width: native.width,
-    native_height: native.height,
-    image_width: fitted.width,
-    image_height: fitted.height,
-    layout: "agent",
-    click_space: "image",
-    note: geometryNote("agent", "image"),
+/** Build the geometry + metadata an agent needs from a daemon frame. */
+export function frameMeta(frame: Frame, profile: ProfileName): ScreenshotMeta {
+  const geo: FrameGeometry = {
+    native_width: frame.native_width,
+    native_height: frame.native_height,
+    image_width: frame.image_width,
+    image_height: frame.image_height,
+    region: frame.region,
   };
-  return { png_base64: out.toString("base64"), meta };
+  const meta: ScreenshotMeta = {
+    ...geo,
+    profile,
+    format: frame.format,
+    visual_tokens: visualTokens(frame.image_width, frame.image_height),
+    settled: frame.settled,
+    capture_ms: frame.capture_ms,
+    note: note(geo, frame.settled),
+  };
+  if (isZoom(geo)) {
+    meta.zoom =
+      Math.round((frame.image_width / Math.max(1, frame.region.width)) * 100) / 100;
+  }
+  return meta;
 }
 
-/** Per-device last-screenshot geometry for click remapping. */
+/** Per-device last-frame geometry for click remapping. */
 export class FrameStateStore {
   private frames = new Map<string, FrameGeometry>();
+  private hashes = new Map<string, string>();
 
   set(key: string, geo: FrameGeometry): void {
-    this.frames.set(key, { ...geo });
+    this.frames.set(key, { ...geo, region: { ...geo.region } });
   }
 
   get(key: string): FrameGeometry | undefined {
     return this.frames.get(key);
   }
 
+  /** Last content hash seen for this device, for `if_none_match`. */
+  lastHash(key: string): string | undefined {
+    return this.hashes.get(key);
+  }
+
+  setHash(key: string, hash: string): void {
+    this.hashes.set(key, hash);
+  }
+
   /**
-   * Remap tool (x,y) to stream pixels using the last screenshot for `key`.
-   * Throws {@link NoFrameGeometryError} if no screenshot has been stored yet.
+   * Remap tool (x,y) to stream pixels using the last frame for `key`.
+   * Throws {@link NoFrameGeometryError} if no screenshot has been taken yet.
    */
   toStream(
     key: string,
     x: number,
     y: number
-  ): {
-    stream_x: number;
-    stream_y: number;
-    click_space: "image" | "native";
-    frame: FrameGeometry;
-  } {
+  ): { stream_x: number; stream_y: number; frame: FrameGeometry } {
     const frame = this.frames.get(key);
     if (!frame) {
       throw new NoFrameGeometryError(key);
     }
-    const mapped = toStreamCoords(x, y, frame);
-    return { ...mapped, frame };
+    return { ...toStreamCoords(x, y, frame), frame };
   }
 }

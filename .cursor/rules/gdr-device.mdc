@@ -30,6 +30,61 @@ treat that as the **active GDR device** for the rest of the turn (and until they
    so it is visible in chat or the editor.
 4. **Stay on that device** for all subsequent `gdr_*` calls until they name another.
 
+## Drive the desktop in as few round trips as possible
+
+Model inference (~5s per observation) dominates; gdrd itself is ~50ms. So the
+cost of a task is essentially *how many screenshots you take*.
+
+- **`gdr_act` over act-then-screenshot.** It runs a sequence and returns the
+  resulting screenshot in one call. Use it for self-contained sequences; keep
+  observing between steps for exploratory navigation or error recovery.
+- **`gdr_zoom` for anything under ~20px** — tray icons, checkboxes, dropdown
+  arrows, tight menu rows. Guess-and-retry on small targets is the most
+  expensive failure mode there is. Zoom coordinates are read off the zoom
+  image; take a full `gdr_screenshot` before clicking outside it.
+- **Never sleep before capturing.** A plain `gdr_screenshot` always returns the
+  newest frame, and it costs ~10–70 ms, so a fixed delay buys nothing. When you
+  need to capture right after your own action, use `gdr_act` — it waits for the
+  UI to stop repainting instead of guessing.
+- **`settled: false` is information, not an error.** Damage is tracked for the
+  whole desktop, so one blinking caret or spinner anywhere keeps every capture
+  "busy". The frame is still the newest one available.
+- **`skip_unchanged: true`** when you only need to know whether something
+  happened — an identical screen returns a note and no image. Expect it to miss
+  on a busy desktop, where something is always repainting.
+- Leave `profile` alone unless you know the target model's budget; the
+  default is sized for Claude's visual-token cap.
+
+## Work on one window, not the whole screen
+
+When the task is "do X in app Y", the window tools cost fewer visual tokens
+and remove a whole class of misfires (clicking a window that was not on top).
+
+- **`gdr_windows`** first — ids, titles, workspaces, and which windows can be
+  captured right now.
+- **`gdr_window_screenshot`** instead of a full screenshot when you only care
+  about one app. It raises the window first, because Wayland streams the
+  composited screen: a minimized or buried window is genuinely not in the
+  pixels.
+- **`gdr_window_act`** is the window-scoped `gdr_act` — it activates, runs the
+  steps, and returns the window's screenshot in one round trip. Activating is
+  the point: the keystrokes land in the window you named, not in whatever had
+  focus.
+- **`gdr_app_launch`** when the app is not running at all.
+- **`gdr_window_pin`** once you know which window you are driving, then drop
+  the selector from every later call. An explicit selector still overrides it;
+  `gdr_window_pin({clear:true})` wipes it.
+- **`gdr_window_events`** with `wait_ms` to wait for a window to appear,
+  instead of screenshotting in a loop.
+
+A selector that matches several windows comes back as an error with the
+candidates listed — narrow it or pass `id`, do not retry the same call.
+
+These need the `gdr-windows` shell extension on the target. If a window tool
+returns the install hint, relay it: the fix is
+`./scripts/install-window-extension.sh` followed by a **log out and back in**,
+and no amount of retrying will change it.
+
 ## Manage devices
 
 - List: `gdr_list_devices`

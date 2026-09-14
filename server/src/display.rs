@@ -9,7 +9,7 @@
 //! down would remove the session's only display. Use `--eager-display` on
 //! headless hosts if you want Meta-* at boot.
 
-use crate::capture::{self, CaptureSize, KeepaliveConsumer};
+use crate::capture::{self, CaptureSize, CapturedFrame, FrameOptions, KeepaliveConsumer};
 use crate::mutter_dbus::MutterSession;
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -27,7 +27,25 @@ pub struct DisplayProvider {
 impl DisplayProvider {
     /// Open the Mutter session and, for virtual monitors, start keepalive
     /// negotiation so Meta-* comes up at `size`.
+    /// Open a session, retrying once if the capture stream comes up dead.
+    ///
+    /// Mutter occasionally hands out a PipeWire node that never produces
+    /// buffers. Reattaching to that node does not help and dropping the last
+    /// consumer can invalidate it outright, so recovery means replacing the
+    /// whole session — which yields a fresh node. Without this, the first
+    /// screenshot after an idle teardown fails outright a fair fraction of
+    /// the time.
     pub async fn start(connector: Option<&str>, size: CaptureSize) -> Result<Self> {
+        let provider = Self::try_start(connector, size).await?;
+        if capture::keepalive_prerolled() {
+            return Ok(provider);
+        }
+        tracing::warn!("capture stream came up dead — restarting Mutter session");
+        provider.shutdown().await;
+        Self::try_start(connector, size).await
+    }
+
+    async fn try_start(connector: Option<&str>, size: CaptureSize) -> Result<Self> {
         let (session, is_virtual) = MutterSession::open_with_info(connector).await?;
         let node_id = session.wait_for_pipewire_node().await?;
 
@@ -84,11 +102,21 @@ impl DisplayProvider {
         self.is_virtual
     }
 
+    /// Connector being streamed, or `None` on a platform virtual monitor.
+    pub fn connector(&self) -> Option<&str> {
+        self.session.connector.as_deref()
+    }
+
     pub async fn capture_png(&self) -> Result<Vec<u8>> {
+        Ok(self.capture_frame(FrameOptions::default()).await?.data)
+    }
+
+    pub async fn capture_frame(&self, opts: FrameOptions) -> Result<CapturedFrame> {
         let node = self.node_id();
         let w = self.size.width;
         let h = self.size.height;
-        tokio::task::spawn_blocking(move || capture::capture_single_frame_png(node, w, h))
+        // GStreamer pulls, resize and encode all block; keep them off the runtime.
+        tokio::task::spawn_blocking(move || capture::capture_single_frame(node, w, h, &opts))
             .await
             .context("capture join")?
     }
@@ -161,11 +189,30 @@ impl DisplayManager {
 
     pub async fn capture_png(&mut self) -> Result<Vec<u8>> {
         self.ensure().await?;
+        self.inner.as_ref().expect("ensure").capture_png().await
+    }
+
+    pub async fn capture_frame(&mut self, opts: FrameOptions) -> Result<CapturedFrame> {
+        self.ensure().await?;
         self.inner
             .as_ref()
             .expect("ensure")
-            .capture_png()
+            .capture_frame(opts)
             .await
+    }
+
+    /// Connector currently being captured, *without* starting ScreenCast.
+    ///
+    /// The window plane needs to know which monitor a crop would come from,
+    /// but listing windows must not be what opens a capture session — the
+    /// whole point of lazy display is that gdrd is not broadcasting until
+    /// someone asks for pixels. Before the first capture this falls back to
+    /// the configured connector, which is `None` on autodetect.
+    pub fn capture_connector(&self) -> Option<String> {
+        self.inner
+            .as_ref()
+            .and_then(|p| p.connector().map(str::to_string))
+            .or_else(|| self.cfg.connector.clone())
     }
 
     /// Ensure ScreenCast is up; returns the live Mutter session.

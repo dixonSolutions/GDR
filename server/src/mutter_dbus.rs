@@ -136,6 +136,10 @@ pub struct MutterSession {
     /// gets passed as the `stream` argument to NotifyPointerMotionAbsolute
     /// so Mutter knows which monitor's coordinate space the x/y are in.
     pub stream_id: String,
+    /// DRM connector this session is recording ("eDP-1"), or `None` for a
+    /// platform virtual monitor. The window plane joins on this to tell a
+    /// window we are streaming from one on a monitor we are not.
+    pub connector: Option<String>,
     /// Cached PipeWire node id once we've seen PipeWireStreamAdded.
     pipewire_node: std::sync::Mutex<Option<u32>>,
 }
@@ -187,7 +191,7 @@ impl MutterSession {
             .build()
             .await?;
 
-        let (stream_path, used_platform_virtual) =
+        let (stream_path, used_platform_virtual, picked_connector) =
             pick_stream(&sc_session, connector).await?;
         let stream_id = stream_path.to_string();
         let sc_stream = ScreenCastStreamProxy::builder(&conn)
@@ -247,6 +251,7 @@ impl MutterSession {
                 sc_session,
                 sc_stream,
                 stream_id,
+                connector: picked_connector,
                 pipewire_node: std::sync::Mutex::new(pipewire_node),
             },
             used_platform_virtual,
@@ -283,16 +288,17 @@ impl MutterSession {
     }
 }
 
+/// Returns `(stream path, used platform virtual, connector recorded)`.
 async fn pick_stream(
     sc_session: &ScreenCastSessionProxy<'_>,
     connector: Option<&str>,
-) -> Result<(OwnedObjectPath, bool)> {
+) -> Result<(OwnedObjectPath, bool, Option<String>)> {
     if let Some(c) = connector {
         let path = sc_session
             .record_monitor(c, stream_props())
             .await
             .with_context(|| format!("record_monitor({c})"))?;
-        return Ok((path, false));
+        return Ok((path, false, Some(c.to_string())));
     }
 
     let connectors = discover_connectors().await.unwrap_or_else(|e| {
@@ -309,7 +315,7 @@ async fn pick_stream(
         match sc_session.record_monitor(c, stream_props()).await {
             Ok(path) => {
                 tracing::info!("recording monitor connector={c}");
-                return Ok((path, false));
+                return Ok((path, false, Some(c.clone())));
             }
             Err(e) => tracing::warn!("record_monitor({c}): {e}"),
         }
@@ -334,16 +340,18 @@ async fn pick_stream(
         .record_virtual(props)
         .await
         .context("record_virtual(is-platform)")?;
-    Ok((path, true))
+    Ok((path, true, None))
 }
 
 fn stream_props() -> std::collections::HashMap<String, zbus::zvariant::Value<'static>> {
     let mut props = std::collections::HashMap::new();
-    // 1 = metadata cursor (drawn by client); 2 = embedded in video.
-    props.insert(
-        "cursor-mode".into(),
-        zbus::zvariant::Value::from(1u32),
-    );
+    // Mutter's CursorMode: 0 = hidden, 1 = embedded, 2 = metadata.
+    //
+    // Embedded is deliberate: the pointer is painted into the frame, so an
+    // agent can see where it is about to click and verify its own aim from
+    // the screenshot alone. The cost is that pointer motion counts as damage
+    // for settle detection and changes the frame hash.
+    props.insert("cursor-mode".into(), zbus::zvariant::Value::from(1u32));
     props
 }
 

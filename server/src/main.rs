@@ -4,6 +4,7 @@ mod display;
 mod mutter_dbus;
 mod tls;
 mod tokens;
+mod windows;
 
 use anyhow::{Context, Result};
 use audit::{now_ts, AuditEvent, AuditLog};
@@ -191,6 +192,25 @@ async fn main() -> Result<()> {
     // Last absolute pointer from MouseMove — Mutter RD has no live query.
     let cursor: CursorState = Arc::new(tokio::sync::Mutex::new(None));
 
+    // Window plane. One session-bus connection for the process; the
+    // extension is looked up per call, so gdrd survives the shell (and the
+    // extension) restarting under it.
+    let window_plane: Option<Arc<windows::WindowPlane>> =
+        match windows::WindowPlane::connect().await {
+            Ok(plane) => {
+                if plane.available().await {
+                    tracing::info!("window plane ready (gdr-windows extension answering)");
+                } else {
+                    tracing::warn!("window plane: {}", windows::INSTALL_HINT);
+                }
+                Some(Arc::new(plane))
+            }
+            Err(e) => {
+                tracing::warn!("no session bus for the window plane: {e:#}");
+                None
+            }
+        };
+
     let listener = TcpListener::bind(&args.bind).await?;
     tracing::info!(
         "listening on {} (tokens={}, audit={})",
@@ -206,6 +226,7 @@ async fn main() -> Result<()> {
         let audit = audit.clone();
         let display = display.clone();
         let cursor = cursor.clone();
+        let window_plane = window_plane.clone();
         let peer_s = peer.to_string();
 
         tokio::spawn(async move {
@@ -226,9 +247,16 @@ async fn main() -> Result<()> {
                     return;
                 }
             };
-            if let Err(e) =
-                handle_connection(tls_stream, &store, &audit, &peer_s, display.as_ref(), &cursor)
-                    .await
+            if let Err(e) = handle_connection(
+                tls_stream,
+                &store,
+                &audit,
+                &peer_s,
+                display.as_ref(),
+                &cursor,
+                window_plane.as_deref(),
+            )
+            .await
             {
                 tracing::warn!("connection {peer_s} ended: {e}");
             }
@@ -243,6 +271,7 @@ async fn handle_connection(
     peer: &str,
     display: Option<&SharedDisplay>,
     cursor: &CursorState,
+    window_plane: Option<&windows::WindowPlane>,
 ) -> Result<()> {
     let auth_info = authenticate(&mut stream, store, audit, peer).await?;
 
@@ -300,7 +329,11 @@ async fn handle_connection(
             }
         }
 
-        let resp = match handle_request(req, display, cursor).await {
+        // Capture the detail before the request is consumed: an audit line
+        // saying only "WindowAction" cannot answer "what closed my editor?".
+        let detail = window_audit_detail(&req);
+
+        let resp = match handle_request(req, display, cursor, window_plane).await {
             Ok(r) => r,
             Err(e) => Response::Error {
                 message: e.to_string(),
@@ -314,7 +347,7 @@ async fn handle_connection(
             token_id: Some(&auth_info.id),
             token_label: Some(&auth_info.label),
             request: Some(req_name),
-            detail: None,
+            detail: detail.as_deref(),
         });
 
         framing::write_message(&mut stream, &resp).await?;
@@ -358,13 +391,37 @@ fn request_name(req: &Request) -> &'static str {
     match req {
         Request::Auth { .. } => "Auth",
         Request::Screenshot { .. } => "Screenshot",
+        Request::CaptureFrame { .. } => "CaptureFrame",
         Request::MouseMove { .. } => "MouseMove",
         Request::MouseButton { .. } => "MouseButton",
         Request::MouseScroll { .. } => "MouseScroll",
         Request::KeyEvent { .. } => "KeyEvent",
         Request::TypeText { .. } => "TypeText",
         Request::GetCursor => "GetCursor",
+        Request::ListWindows { .. } => "ListWindows",
+        Request::WindowAction { .. } => "WindowAction",
+        Request::LaunchApp { .. } => "LaunchApp",
+        Request::ListApps { .. } => "ListApps",
+        Request::WindowEvents { .. } => "WindowEvents",
         Request::Ping => "Ping",
+    }
+}
+
+/// Detail string recorded in the audit log for window-plane requests.
+///
+/// The generic per-request audit line only names the request type, which is
+/// useless for "who closed my editor?". Window operations name a specific
+/// window, so record which one and what was done to it.
+fn window_audit_detail(req: &Request) -> Option<String> {
+    match req {
+        Request::WindowAction { target, op } => Some(format!(
+            "{} target[{}]{}",
+            op.name(),
+            target.describe(),
+            if op.is_destructive() { " destructive" } else { "" }
+        )),
+        Request::LaunchApp { app_id } => Some(format!("launch {app_id}")),
+        _ => None,
     }
 }
 
@@ -372,6 +429,7 @@ async fn handle_request(
     req: Request,
     display: Option<&SharedDisplay>,
     cursor: &CursorState,
+    window_plane: Option<&windows::WindowPlane>,
 ) -> Result<Response> {
     match req {
         Request::Auth { .. } => Ok(Response::Error {
@@ -402,6 +460,62 @@ async fn handle_request(
             let png = guard.capture_png().await?;
             let png_base64 = base64::engine::general_purpose::STANDARD.encode(&png);
             Ok(Response::Screenshot { png_base64 })
+        }
+
+        Request::CaptureFrame {
+            region,
+            max_width,
+            max_height,
+            max_long_edge,
+            max_patches,
+            patch_size,
+            format,
+            quality,
+            settle,
+            if_none_match,
+        } => {
+            let display = display
+                .ok_or_else(|| anyhow::anyhow!("display provider not available"))?;
+            let started = std::time::Instant::now();
+            let opts = capture::FrameOptions {
+                region,
+                max_width,
+                max_height,
+                max_long_edge,
+                max_patches,
+                patch_size,
+                format,
+                quality,
+                settle,
+            };
+            let frame = {
+                let mut guard = display.lock().await;
+                guard.capture_frame(opts).await?
+            };
+
+            // Identical screen: reply with the hash only. Saves ~1500 visual
+            // tokens and, more usefully, tells the agent its action had no
+            // visible effect instead of leaving it to diff two images.
+            let unchanged = if_none_match.as_deref() == Some(frame.hash.as_str());
+            let data_base64 = if unchanged {
+                String::new()
+            } else {
+                base64::engine::general_purpose::STANDARD.encode(&frame.data)
+            };
+
+            Ok(Response::Frame(Box::new(common::Frame {
+                data_base64,
+                format: frame.format,
+                native_width: frame.native_width,
+                native_height: frame.native_height,
+                region: frame.region,
+                image_width: frame.image_width,
+                image_height: frame.image_height,
+                hash: frame.hash,
+                unchanged,
+                settled: frame.settled,
+                capture_ms: started.elapsed().as_millis() as u64,
+            })))
         }
 
         Request::MouseMove { x, y } => {
@@ -455,6 +569,65 @@ async fn handle_request(
             Ok(Response::Ok)
         }
 
+        Request::ListWindows {
+            include_skip_taskbar,
+        } => {
+            let plane = require_window_plane(window_plane)?;
+            let (connector, size) = capture_context(display).await;
+            let list = plane
+                .list(connector.as_deref(), size, include_skip_taskbar)
+                .await?;
+            Ok(Response::Windows(Box::new(list)))
+        }
+
+        Request::WindowAction { target, op } => {
+            let plane = require_window_plane(window_plane)?;
+            let (connector, size) = capture_context(display).await;
+            let list = plane.list(connector.as_deref(), size, true).await?;
+            let window = target.resolve(&list.windows).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let id = window.id;
+            let label = window.label();
+            let (action, after) = plane.act(id, op).await?;
+            tracing::info!("window {action}: id={id} {label}");
+            Ok(Response::WindowActed {
+                action,
+                window: after.map(Box::new),
+                detail: Some(label),
+            })
+        }
+
+        Request::LaunchApp { app_id } => {
+            let plane = require_window_plane(window_plane)?;
+            let (id, name, was_running) = plane.launch(&app_id).await?;
+            Ok(Response::AppLaunched {
+                app_id: id,
+                name,
+                was_running,
+            })
+        }
+
+        Request::ListApps { filter } => {
+            let plane = require_window_plane(window_plane)?;
+            let apps = plane.list_apps(filter.as_deref()).await?;
+            Ok(Response::Apps { apps })
+        }
+
+        Request::WindowEvents {
+            since,
+            limit,
+            wait_ms,
+        } => {
+            let plane = require_window_plane(window_plane)?;
+            let (events, next_seq, dropped, reset) =
+                plane.events(since, limit, wait_ms).await?;
+            Ok(Response::WindowEvents {
+                events,
+                next_seq,
+                dropped,
+                reset,
+            })
+        }
+
         Request::TypeText { text } => {
             let display = display
                 .ok_or_else(|| anyhow::anyhow!("display provider not available"))?;
@@ -480,4 +653,31 @@ async fn handle_request(
             Ok(Response::Ok)
         }
     }
+}
+
+fn require_window_plane(plane: Option<&windows::WindowPlane>) -> Result<&windows::WindowPlane> {
+    plane.ok_or_else(|| {
+        anyhow::anyhow!(
+            "gdrd has no session bus connection, so it cannot see windows at all. \
+             It must run inside the graphical session (systemd --user), not as a \
+             system service."
+        )
+    })
+}
+
+/// What gdrd is currently streaming, for logical → stream conversion.
+///
+/// Deliberately does *not* start ScreenCast: listing windows is metadata and
+/// must not be the thing that begins broadcasting the desktop. Before the
+/// first capture the size is unknown and windows come back without a
+/// `stream_region`, which is honest — we genuinely cannot say where a crop
+/// would land until the stream has negotiated.
+async fn capture_context(
+    display: Option<&SharedDisplay>,
+) -> (Option<String>, Option<(u32, u32)>) {
+    let connector = match display {
+        Some(d) => d.lock().await.capture_connector(),
+        None => None,
+    };
+    (connector, capture::stream_size())
 }

@@ -9,11 +9,12 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsc && node --test dist/screenshotLayout.test.js dist/lockHint.test.js"
+    "test": "tsc && node --test dist/screenshotLayout.test.js dist/lockHint.test.js dist/windows.test.js dist/windowPin.test.js",
+    "bench": "npm run build && node bench.mjs",
+    "e2e": "node e2e.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "sharp": "^0.34.2",
     "zod": "^3.23.0"
   },
   "devDependencies": {

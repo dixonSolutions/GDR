@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Task 2 — Cycle every swatch to green</title>
+    <link rel="stylesheet" href="/task.css" />
+    <style>
+      #grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: var(--space-3);
+      }
+      .swatch {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: var(--space-1);
+        height: 108px;
+        border-radius: var(--radius);
+        border: 1px solid rgba(0, 0, 0, 0.14);
+        cursor: pointer;
+        color: #fff;
+        font-weight: 700;
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+        transition: background-color 120ms ease;
+      }
+      .swatch .name {
+        font-size: 17px;
+        letter-spacing: 0.01em;
+      }
+      /* Small caption on a coloured field: legible natively, and the first
+       * thing to blur if a capture is downscaled too aggressively. */
+      .swatch .hint {
+        font-size: 12px;
+        font-weight: 600;
+        opacity: 0.9;
+      }
+      .legend {
+        display: flex;
+        gap: var(--space-3);
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .chip {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-2);
+        font-size: 14px;
+        color: var(--text-muted);
+      }
+      .dot {
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        border: 1px solid rgba(0, 0, 0, 0.15);
+      }
+    </style>
+  </head>
+  <body>
+    <header class="task-bar">
+      <div>
+        <h1>Task 2 — Cycle every swatch to green</h1>
+        <p class="goal">
+          Each click advances a swatch one step: red → amber → green → blue → red.
+        </p>
+      </div>
+      <div class="status" id="status">0 / 12 green</div>
+    </header>
+
+    <main>
+      <div class="card">
+        <h2>Colour order</h2>
+        <div class="legend" id="legend"></div>
+        <p class="muted" style="margin-top: var(--space-3)">
+          A swatch showing amber needs one click to reach green; red needs two; blue needs three.
+        </p>
+      </div>
+
+      <div class="card">
+        <div id="grid"></div>
+      </div>
+
+      <div class="done-banner"></div>
+      <p class="muted" id="tally">Clicks: 0 · overshoots: 0</p>
+    </main>
+
+    <script type="module">
+      import { rng, seedFromUrl, start, complete, progress, publish } from "/task.js";
+
+      const TASK = "cycle";
+      const seed = seedFromUrl(23);
+      const rand = rng(seed);
+
+      // Order is the whole puzzle: reaching green means counting steps from
+      // wherever a swatch currently sits, not just clicking until it looks right.
+      const CYCLE = [
+        { name: "Red", css: "#dc2626" },
+        { name: "Amber", css: "#d97706" },
+        { name: "Green", css: "#15803d" },
+        { name: "Blue", css: "#1d4ed8" },
+      ];
+      const GREEN = 2;
+      const COUNT = 12;
+
+      const grid = document.getElementById("grid");
+      const statusEl = document.getElementById("status");
+      const tallyEl = document.getElementById("tally");
+
+      document.getElementById("legend").innerHTML = CYCLE.map(
+        (c, i) =>
+          `<span class="chip"><span class="dot" style="background:${c.css}"></span>${i + 1}. ${c.name}</span>`
+      ).join("");
+
+      let clicks = 0;
+      let overshoots = 0;
+      let done = false;
+
+      const swatches = [];
+      for (let i = 0; i < COUNT; i++) {
+        // Never start on green: every swatch must be worked on, so an agent
+        // cannot score by leaving most of the board untouched.
+        const startIdx = [0, 1, 3][Math.floor(rand() * 3)];
+        const el = document.createElement("div");
+        el.className = "swatch";
+        el.dataset.index = String(i);
+        el.innerHTML = `<span class="name"></span><span class="hint">swatch ${i + 1}</span>`;
+        grid.appendChild(el);
+        swatches.push({ el, idx: startIdx });
+      }
+
+      function paint(s) {
+        const c = CYCLE[s.idx];
+        s.el.style.background = c.css;
+        s.el.querySelector(".name").textContent = c.name;
+      }
+
+      function greenCount() {
+        return swatches.filter((s) => s.idx === GREEN).length;
+      }
+
+      function optimalClicks() {
+        // Minimum total clicks from the starting board, computed once.
+        return swatches.reduce((sum, s) => sum + ((GREEN - s.start + 4) % 4), 0);
+      }
+
+      swatches.forEach((s) => {
+        s.start = s.idx;
+        paint(s);
+      });
+      const OPTIMAL = optimalClicks();
+
+      function refresh() {
+        statusEl.textContent = `${greenCount()} / ${COUNT} green`;
+        tallyEl.textContent = `Clicks: ${clicks} · overshoots: ${overshoots}`;
+        publish({ task: TASK, seed, green: greenCount(), total: COUNT, clicks, overshoots, done });
+      }
+
+      grid.addEventListener("click", (ev) => {
+        if (done) return;
+        const el = ev.target.closest(".swatch");
+        if (!el) return;
+        const s = swatches[Number(el.dataset.index)];
+
+        clicks += 1;
+        // Clicking a swatch that is already green pushes it off green: the
+        // cost of not tracking state, and the main way runs lose points here.
+        if (s.idx === GREEN) {
+          overshoots += 1;
+          progress(TASK, { event: "overshoot", index: el.dataset.index });
+        }
+        s.idx = (s.idx + 1) % CYCLE.length;
+        paint(s);
+        refresh();
+
+        if (greenCount() === COUNT) {
+          done = true;
+          complete(TASK, {
+            success: true,
+            score: Math.min(1, OPTIMAL / Math.max(clicks, 1)),
+            detail: { clicks, overshoots, optimal: OPTIMAL },
+          });
+          refresh();
+        }
+      });
+
+      start(TASK, { seed, swatches: COUNT, optimal_clicks: OPTIMAL });
+      refresh();
+    </script>
+  </body>
+</html>

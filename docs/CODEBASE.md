@@ -21,6 +21,7 @@ GDR/
 |---|---|
 | `src/lib.rs` | `Request` / `Response`, framing, keymap, tests |
 | `src/scopes.rs` | `Scope`, `ScopeSet`, parse `"all"` / `"screenshot,mouse"` |
+| `src/windows.rs` | `WindowInfo`/`WindowTarget`/`WindowOp`, selector resolution + its ambiguity rules |
 
 No GStreamer/D-Bus. Builds on any host. Heavy unit-test coverage for the wire format.
 
@@ -34,6 +35,7 @@ No GStreamer/D-Bus. Builds on any host. Heavy unit-test coverage for the wire fo
 | `src/tls.rs` | self-signed cert load/generate + fingerprint |
 | `src/mutter_dbus.rs` | zbus proxies for Mutter RD / ScreenCast |
 | `src/capture.rs` | GStreamer `pipewiresrc` → PNG |
+| `src/windows.rs` | client for the `org.gdr.Windows` shell extension; logical → stream geometry |
 
 Must build **on the target** (or a matching Linux userspace) because of
 GStreamer/PipeWire/D-Bus native deps.
@@ -56,6 +58,17 @@ Builds anywhere with a Rust toolchain (no GStreamer).
 | `src/index.ts` | MCP tool registration |
 | `src/gdrClient.ts` | TLS client + framing (TS mirror of common) |
 | `src/config.ts` | shared config.json reader + password messages |
+| `src/windows.ts` | window selection, ambiguity reporting, pin fallback (pure) |
+| `src/windowPin.ts` | pin storage in config.json + the controller-side window log |
+
+### `shell-extension` (`gdr-windows@gdr.dixonsolutions.github.io`)
+
+GJS, runs inside gnome-shell, exports `org.gdr.Windows` on the session bus.
+The only way to enumerate or raise a window on GNOME 50 — see
+[WINDOWS.md](./WINDOWS.md). Deliberately a thin accessor: `List`, `Act`,
+`Launch`, `ListApps`, `Events`. Every judgement call (selector resolution,
+coordinate conversion, pinning) lives in gdrd or the MCP server, where it can
+be unit-tested; the extension can only be tested by logging in.
 
 ## Where to change what
 
@@ -66,6 +79,7 @@ Builds anywhere with a Rust toolchain (no GStreamer).
 | Change remembered hosts | `client/config.rs`, `mcp-server/src/config.ts`, CONFIG.md |
 | Change install flow | `deploy.sh`, DEPLOYMENT.md |
 | Change Mutter integration | `server/mutter_dbus.rs` (re-introspect after GNOME upgrades) |
+| Add a window capability | `shell-extension/…/extension.js` + `server/windows.rs` + `common/windows.rs` + MCP tool + WINDOWS.md |
 
 ## Tests layout
 

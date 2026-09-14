@@ -20,6 +20,7 @@
 #   ./scripts/update.sh user@host --binary
 #   ./scripts/update.sh user@host --source
 #   GDR_YES=1 GDR_SUDO_PASSWORD=… ./scripts/update.sh
+#   GDR_SSH_PASSWORD=… ./scripts/update.sh   # SSH login when keys fail (or store user_password)
 #
 # Interactive picker (when not using --yes / --machines):
 #   a = yes, all machines

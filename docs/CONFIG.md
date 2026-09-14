@@ -18,7 +18,14 @@ Always written `chmod 600`.
       "label": "office tower",
       "aliases": ["office"],
       "sudo_password": null,
-      "user_password": null
+      "user_password": null,
+      "pinned_window": {
+        "id": 91,
+        "app_id": "org.gnome.TextEditor.desktop",
+        "title": "notes",
+        "label": "notes editor",
+        "pinned_at": "2026-09-07T10:00:00.000Z"
+      }
     },
     "local": {
       "address": "localhost",
@@ -43,6 +50,7 @@ Always written `chmod 600`.
 | `aliases` | opt | Extra names that resolve to this device |
 | `sudo_password` | opt-in | Plaintext; deploy + `gdr_get_password` |
 | `user_password` | opt-in | Plaintext; same exposure model |
+| `pinned_window` | opt | Default window for the window tools on this device — see [WINDOWS.md](./WINDOWS.md). Set by `gdr_window_pin`; both front-ends carry it through a profile rewrite, so `device add` does not wipe it |
 
 Lookups accept **id**, **label**, or **alias** (case-insensitive), e.g. `home computer`.
 

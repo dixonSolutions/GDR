@@ -1,237 +1,267 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
-import sharp from "sharp";
+import type { Frame, Region } from "./gdrClient.js";
 import {
-  AGENT_MAX_HEIGHT,
-  AGENT_MAX_WIDTH,
-  applyScreenshotLayout,
-  fitInside,
+  DEFAULT_PROFILE,
   FrameStateStore,
   NoFrameGeometryError,
-  parsePngSize,
+  OutOfFrameError,
+  PATCH,
+  SIZING_PROFILES,
+  frameMeta,
+  isZoom,
+  profileForLayout,
+  profileRequest,
   toStreamCoords,
+  visualTokens,
+  type FrameGeometry,
 } from "./screenshotLayout.js";
 
-/** Minimal valid-enough PNG for IHDR parsing (CRC not validated by parsePngSize). */
-function fakePng(width: number, height: number): Buffer {
-  const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-  const ihdr = Buffer.alloc(25);
-  ihdr.writeUInt32BE(13, 0);
-  ihdr.write("IHDR", 4, 4, "ascii");
-  ihdr.writeUInt32BE(width, 8);
-  ihdr.writeUInt32BE(height, 12);
-  ihdr[16] = 8; // bit depth
-  ihdr[17] = 2; // color type RGB
-  ihdr[18] = 0;
-  ihdr[19] = 0;
-  ihdr[20] = 0;
-  ihdr.writeUInt32BE(0, 21); // fake CRC
-  return Buffer.concat([sig, ihdr]);
+function region(x: number, y: number, width: number, height: number): Region {
+  return { x, y, width, height };
 }
 
-describe("parsePngSize", () => {
-  it("reads IHDR width/height", () => {
-    const size = parsePngSize(fakePng(1920, 1080));
-    assert.deepEqual(size, { width: 1920, height: 1080 });
+function fullFrame(
+  nativeW: number,
+  nativeH: number,
+  imageW: number,
+  imageH: number
+): FrameGeometry {
+  return {
+    native_width: nativeW,
+    native_height: nativeH,
+    image_width: imageW,
+    image_height: imageH,
+    region: region(0, 0, nativeW, nativeH),
+  };
+}
+
+describe("visualTokens", () => {
+  it("matches the published patch formula", () => {
+    assert.equal(visualTokens(1092, 1092), 1521);
+    assert.equal(visualTokens(200, 200), 64);
+    assert.equal(visualTokens(1920, 1080), 2691);
   });
 
-  it("rejects non-PNG", () => {
-    assert.throws(
-      () => parsePngSize(Buffer.alloc(32, 0x41)),
-      /not a PNG/
-    );
+  it("shows why the old 1440x900 box was over budget", () => {
+    // The regression this whole sizing change exists to prevent: it looks
+    // conservative in pixels but costs 52*33 patches against a 1568 cap,
+    // so the model API downscales again and every click is offset.
+    assert.equal(visualTokens(1440, 900), 1716);
+    assert.ok(visualTokens(1440, 900) > SIZING_PROFILES.claude.maxPatches);
+    // 16:9 sources stayed under it purely by luck of aspect ratio.
+    assert.ok(visualTokens(1440, 810) <= SIZING_PROFILES.claude.maxPatches);
   });
 });
 
-describe("fitInside", () => {
-  it("no-ops when already within the box", () => {
-    assert.deepEqual(fitInside(1280, 720), { width: 1280, height: 720 });
-    assert.deepEqual(fitInside(1440, 900), { width: 1440, height: 900 });
+describe("profileRequest", () => {
+  it("sends the patch budget for Claude tiers", () => {
+    const req = profileRequest("claude");
+    assert.equal(req.max_patches, 1568);
+    assert.equal(req.patch_size, PATCH);
+    assert.equal(req.max_long_edge, 1568);
+    assert.equal(req.max_width, undefined);
+
+    assert.equal(profileRequest("claude-hires").max_patches, 4784);
   });
 
-  it("scales 1920×1080 to fit 1440×900", () => {
-    const fitted = fitInside(1920, 1080);
-    assert.equal(fitted.width, 1440);
-    assert.equal(fitted.height, 810);
-    assert.ok(fitted.width <= AGENT_MAX_WIDTH);
-    assert.ok(fitted.height <= AGENT_MAX_HEIGHT);
+  it("sends a pixel box for OpenAI, which has no patch cap", () => {
+    const req = profileRequest("openai");
+    assert.deepEqual(
+      { w: req.max_width, h: req.max_height, patches: req.max_patches },
+      { w: 1440, h: 900, patches: undefined }
+    );
   });
 
-  it("scales tall displays by height", () => {
-    const fitted = fitInside(1080, 1920);
-    assert.equal(fitted.height, 900);
-    assert.ok(fitted.width <= AGENT_MAX_WIDTH);
+  it("sends no constraints at all for raw", () => {
+    assert.deepEqual(profileRequest("raw"), {});
+  });
+});
+
+describe("profileForLayout", () => {
+  it("prefers an explicit profile over the coarse layout knob", () => {
+    assert.equal(profileForLayout("raw", "claude-hires"), "claude-hires");
+  });
+
+  it("maps the legacy layout values", () => {
+    assert.equal(profileForLayout("raw", undefined), "raw");
+    assert.equal(profileForLayout("agent", undefined), DEFAULT_PROFILE);
+    assert.equal(profileForLayout(undefined, undefined), DEFAULT_PROFILE);
   });
 });
 
 describe("toStreamCoords", () => {
-  const downscaled = {
-    native_width: 1920,
-    native_height: 1080,
-    image_width: 1440,
-    image_height: 810,
-    click_space: "image" as const,
-  };
-
-  it("scales image space to native (1920×1080 from 1440×810)", () => {
-    const mapped = toStreamCoords(720, 405, downscaled);
-    assert.equal(mapped.stream_x, 960);
-    assert.equal(mapped.stream_y, 540);
-    assert.equal(mapped.click_space, "image");
+  it("scales image coords back to native pixels", () => {
+    const frame = fullFrame(1920, 1080, 1440, 810);
+    assert.deepEqual(toStreamCoords(720, 405, frame), { stream_x: 960, stream_y: 540 });
+    assert.deepEqual(toStreamCoords(0, 0, frame), { stream_x: 0, stream_y: 0 });
   });
 
-  it("clamps image-edge / off-by-one into native bounds", () => {
-    const mapped = toStreamCoords(1440, 810, downscaled);
-    assert.equal(mapped.stream_x, 1919);
-    assert.equal(mapped.stream_y, 1079);
+  it("is identity when the image is already native", () => {
+    const frame = fullFrame(1920, 1080, 1920, 1080);
+    assert.deepEqual(toStreamCoords(123, 456, frame), { stream_x: 123, stream_y: 456 });
   });
 
-  it("clamps negative coords to 0", () => {
-    const mapped = toStreamCoords(-1, -5, downscaled);
-    assert.equal(mapped.stream_x, 0);
-    assert.equal(mapped.stream_y, 0);
+  it("clamps the far edge inside the stream", () => {
+    const frame = fullFrame(1920, 1080, 1440, 810);
+    const mapped = toStreamCoords(1440, 810, frame);
+    assert.ok(mapped.stream_x <= 1919 && mapped.stream_y <= 1079);
   });
 
-  it("identity when sizes match, still clamped", () => {
-    const frame = {
-      native_width: 100,
-      native_height: 50,
-      image_width: 100,
-      image_height: 50,
-      click_space: "native" as const,
+  it("folds a zoom's crop origin into the remap", () => {
+    // 400x300 crop at +1000,+700, returned 1:1. Clicking the middle of the
+    // zoom must land in the middle of that region on the real desktop.
+    const zoom: FrameGeometry = {
+      native_width: 1920,
+      native_height: 1200,
+      image_width: 400,
+      image_height: 300,
+      region: region(1000, 700, 400, 300),
     };
-    assert.deepEqual(toStreamCoords(10, 20, frame), {
-      stream_x: 10,
-      stream_y: 20,
-      click_space: "native",
-    });
-    assert.deepEqual(toStreamCoords(100, 50, frame), {
-      stream_x: 99,
-      stream_y: 49,
-      click_space: "native",
-    });
+    assert.deepEqual(toStreamCoords(200, 150, zoom), { stream_x: 1200, stream_y: 850 });
+    assert.deepEqual(toStreamCoords(0, 0, zoom), { stream_x: 1000, stream_y: 700 });
   });
 
-  it("rejects invalid geometry", () => {
-    assert.throws(
-      () =>
-        toStreamCoords(1, 1, {
-          native_width: 0,
-          native_height: 1080,
-          image_width: 1440,
-          image_height: 810,
-          click_space: "image",
-        }),
-      /invalid frame geometry/
+  it("handles a zoom that was itself downscaled", () => {
+    const zoom: FrameGeometry = {
+      native_width: 1920,
+      native_height: 1200,
+      image_width: 200,
+      image_height: 150,
+      region: region(1000, 700, 400, 300),
+    };
+    assert.deepEqual(toStreamCoords(100, 75, zoom), { stream_x: 1200, stream_y: 850 });
+  });
+
+  it("rejects coordinates outside the image instead of extrapolating", () => {
+    // The dangerous case: agent zooms in, then sends full-desktop coords.
+    // Extrapolating would click somewhere plausible but wrong.
+    const zoom: FrameGeometry = {
+      native_width: 1920,
+      native_height: 1200,
+      image_width: 400,
+      image_height: 300,
+      region: region(1000, 700, 400, 300),
+    };
+    assert.throws(() => toStreamCoords(1500, 900, zoom), OutOfFrameError);
+    assert.throws(() => toStreamCoords(-10, 5, zoom), OutOfFrameError);
+    assert.throws(() => toStreamCoords(1500, 900, zoom), /zoom/);
+  });
+
+  it("rejects non-finite coordinates", () => {
+    assert.throws(() => toStreamCoords(NaN, 0, fullFrame(100, 100, 100, 100)), /non-finite/);
+  });
+});
+
+describe("isZoom", () => {
+  it("is false for a full-desktop frame at any scale", () => {
+    assert.equal(isZoom(fullFrame(1920, 1200, 1344, 840)), false);
+  });
+
+  it("is true when the region is a subset", () => {
+    assert.equal(
+      isZoom({
+        native_width: 1920,
+        native_height: 1200,
+        image_width: 400,
+        image_height: 300,
+        region: region(10, 10, 400, 300),
+      }),
+      true
     );
   });
+});
 
-  it("round-trips center of agent image", () => {
-    const nativeW = 1920;
-    const nativeH = 1080;
-    const fitted = fitInside(nativeW, nativeH);
-    const frame = {
-      native_width: nativeW,
-      native_height: nativeH,
-      image_width: fitted.width,
-      image_height: fitted.height,
-      click_space: "image" as const,
-    };
-    const cx = fitted.width / 2;
-    const cy = fitted.height / 2;
-    const mapped = toStreamCoords(cx, cy, frame);
-    assert.ok(Math.abs(mapped.stream_x - nativeW / 2) < 1e-9);
-    assert.ok(Math.abs(mapped.stream_y - nativeH / 2) < 1e-9);
+describe("frameMeta", () => {
+  const base: Frame = {
+    data_base64: "",
+    format: "jpeg",
+    native_width: 1920,
+    native_height: 1200,
+    region: region(0, 0, 1920, 1200),
+    image_width: 1344,
+    image_height: 840,
+    hash: "abc",
+    unchanged: false,
+    settled: true,
+    capture_ms: 42,
+  };
+
+  it("reports the billed token cost, under budget", () => {
+    const meta = frameMeta(base, "claude");
+    assert.equal(meta.visual_tokens, visualTokens(1344, 840));
+    assert.ok(meta.visual_tokens <= SIZING_PROFILES.claude.maxPatches);
+    assert.match(meta.note, /re-screenshot/);
+    assert.equal(meta.zoom, undefined);
+  });
+
+  it("says so when the screen never settled, without crying wolf", () => {
+    const meta = frameMeta({ ...base, settled: false }, "claude");
+    assert.match(meta.note, /still animating/);
+    assert.match(meta.note, /newest frame/);
+    // A spinner elsewhere on screen is benign; this must not read as failure.
+    assert.doesNotMatch(meta.note, /WARNING|ERROR/);
+  });
+
+  it("labels zoom frames and states their coordinate space", () => {
+    const meta = frameMeta(
+      { ...base, region: region(1000, 700, 400, 300), image_width: 400, image_height: 300 },
+      "raw"
+    );
+    assert.match(meta.note, /^ZOOM/);
+    assert.match(meta.note, /full gdr_screenshot/);
+    assert.equal(meta.zoom, 1);
   });
 });
 
 describe("FrameStateStore", () => {
-  it("throws before set; remaps after set", () => {
+  it("throws a clear error before any screenshot", () => {
     const store = new FrameStateStore();
-    assert.throws(() => store.toStream("dev", 10, 20), (err: unknown) => {
-      assert.ok(err instanceof NoFrameGeometryError);
-      assert.equal(err.key, "dev");
-      assert.match(err.message, /gdr_screenshot/);
-      return true;
-    });
+    assert.throws(() => store.toStream("local", 10, 10), NoFrameGeometryError);
+    assert.throws(() => store.toStream("local", 10, 10), /call gdr_screenshot/);
+  });
 
-    store.set("dev", {
+  it("remaps using the most recent frame for that device", () => {
+    const store = new FrameStateStore();
+    store.set("local", fullFrame(1920, 1080, 1440, 810));
+    assert.deepEqual(
+      { ...store.toStream("local", 720, 405), frame: undefined },
+      { stream_x: 960, stream_y: 540, frame: undefined }
+    );
+
+    // A zoom replaces the geometry; later clicks use the zoom's space.
+    store.set("local", {
       native_width: 1920,
       native_height: 1080,
-      image_width: 1440,
-      image_height: 810,
-      layout: "agent",
-      click_space: "image",
+      image_width: 400,
+      image_height: 300,
+      region: region(100, 200, 400, 300),
     });
-    const after = store.toStream("dev", 720, 405);
-    assert.equal(after.stream_x, 960);
-    assert.equal(after.stream_y, 540);
-    assert.equal(after.click_space, "image");
-  });
-});
-
-describe("applyScreenshotLayout", () => {
-  it("raw passes through bytes and reports native click_space", async () => {
-    const png = await sharp({
-      create: {
-        width: 100,
-        height: 80,
-        channels: 3,
-        background: { r: 10, g: 20, b: 30 },
-      },
-    })
-      .png()
-      .toBuffer();
-    const b64 = png.toString("base64");
-    const applied = await applyScreenshotLayout(b64, "raw");
-    assert.equal(applied.png_base64, b64);
-    assert.equal(applied.meta.layout, "raw");
-    assert.equal(applied.meta.click_space, "native");
-    assert.equal(applied.meta.image_width, 100);
-    assert.equal(applied.meta.native_width, 100);
+    const after = store.toStream("local", 0, 0);
+    assert.deepEqual({ x: after.stream_x, y: after.stream_y }, { x: 100, y: 200 });
   });
 
-  it("agent no-ops under 1440×900", async () => {
-    const png = await sharp({
-      create: {
-        width: 800,
-        height: 600,
-        channels: 3,
-        background: { r: 1, g: 2, b: 3 },
-      },
-    })
-      .png()
-      .toBuffer();
-    const applied = await applyScreenshotLayout(png.toString("base64"), "agent");
-    assert.equal(applied.meta.image_width, 800);
-    assert.equal(applied.meta.image_height, 600);
-    assert.equal(applied.meta.click_space, "native");
+  it("keeps devices independent", () => {
+    const store = new FrameStateStore();
+    store.set("a", fullFrame(1920, 1080, 1920, 1080));
+    store.set("b", fullFrame(1920, 1080, 960, 540));
+    assert.equal(store.toStream("a", 100, 100).stream_x, 100);
+    assert.equal(store.toStream("b", 100, 100).stream_x, 200);
   });
 
-  it("agent downscales 1920×1080 to 1440×810", async () => {
-    const png = await sharp({
-      create: {
-        width: 1920,
-        height: 1080,
-        channels: 3,
-        background: { r: 40, g: 50, b: 60 },
-      },
-    })
-      .png()
-      .toBuffer();
-    const beforeHash = createHash("sha256").update(png).digest("hex");
-    const applied = await applyScreenshotLayout(png.toString("base64"), "agent");
-    const out = Buffer.from(applied.png_base64, "base64");
-    const afterHash = createHash("sha256").update(out).digest("hex");
-    assert.notEqual(beforeHash, afterHash);
-    assert.deepEqual(parsePngSize(out), { width: 1440, height: 810 });
-    assert.equal(applied.meta.native_width, 1920);
-    assert.equal(applied.meta.native_height, 1080);
-    assert.equal(applied.meta.image_width, 1440);
-    assert.equal(applied.meta.image_height, 810);
-    assert.equal(applied.meta.click_space, "image");
-    assert.equal(applied.meta.layout, "agent");
-    assert.match(applied.meta.note, /re-screenshot/);
+  it("does not alias stored geometry with the caller's object", () => {
+    const store = new FrameStateStore();
+    const geo = fullFrame(1920, 1080, 1440, 810);
+    store.set("local", geo);
+    geo.region.x = 999;
+    assert.equal(store.get("local")!.region.x, 0);
+  });
+
+  it("tracks the last content hash per device for unchanged detection", () => {
+    const store = new FrameStateStore();
+    assert.equal(store.lastHash("local"), undefined);
+    store.setHash("local", "deadbeef");
+    assert.equal(store.lastHash("local"), "deadbeef");
+    assert.equal(store.lastHash("other"), undefined);
   });
 });

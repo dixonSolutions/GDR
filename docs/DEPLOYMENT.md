@@ -117,6 +117,7 @@ Multi-host tokens stay in `~/.config/gdr/config.json`; tools take `host=`.
 | `scripts/update-mcp.sh [--restart-cursor]` | Rebuild MCP only; optional AI-host MCP restart |
 | `scripts/setup-mcp-cursor.sh` | Cursor global `~/.cursor/mcp.json` |
 | `scripts/install-local.sh` | User-local gdrd only (loopback + `local` profile) |
+| `scripts/install-window-extension.sh [user@host\|--dev id]` | GNOME Shell extension for the window plane. **Requires a log out / log back in afterwards** |
 | `scripts/status.sh user@host` | unit status, fingerprint, logs |
 | `scripts/rotate-token.sh user@host` | new GDR_TOKEN + seed |
 | `scripts/uninstall.sh user@host` | stop unit, remove binary + `~/.local/share/gdr` |
@@ -149,6 +150,32 @@ local work is never discarded. Remote paths tried: `~/SideProjects/GDR`,
 Remotes come from `~/.config/gdr/config.json` (unique `ssh` targets; localhost
 skipped). Matching distro packages install over SSH (stored `sudo_password`
 when set); mismatched remotes get a binary fallback + user-unit restart.
+
+SSH login prefers keys (`BatchMode`). If publickey fails, `update.sh` tries
+`user_password` from the host profile, then `GDR_SSH_PASSWORD`, then prompts
+on the TTY (cached for the rest of the run). Password auth needs `sshpass`.
+
+## Window plane (one extra step, once per target)
+
+Screenshots and input work with nothing beyond `gdrd`. Enumerating windows or
+activating one does not: GNOME 50 refuses
+`org.gnome.Shell.Introspect.GetWindows` to unprivileged callers and Mutter's
+screencast API only knows about pixels, so a small GNOME Shell extension has
+to run inside the session.
+
+```bash
+./scripts/install-window-extension.sh --dev desktop
+# then, on the target: log out and back in
+gdr --host desktop windows
+```
+
+The log-out is a hard requirement, not caution: on Wayland gnome-shell scans
+the extension directories only at session start and cannot be restarted in
+place, so until then `gnome-extensions enable` reports that the extension does
+not exist. Full rationale in [WINDOWS.md](./WINDOWS.md).
+
+Existing tokens minted with `--scope all` already cover the `window` scope.
+Tokens with an explicit scope list need it added.
 
 ## Cert rotation
 

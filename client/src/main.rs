@@ -123,6 +123,67 @@ enum Command {
         token_id: Option<String>,
     },
 
+    /// List windows on the target desktop (needs the gdr-windows extension).
+    Windows {
+        /// Only windows whose app id, WM_CLASS or title contains this.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Include docks, panels and notification popups.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Act on one window: activate, minimize, close, move, resize, …
+    Window {
+        /// activate | focus | raise | minimize | unminimize | maximize |
+        /// unmaximize | fullscreen | unfullscreen | above | unabove |
+        /// stick | unstick | close | move | resize | move_resize | workspace
+        action: String,
+        /// Exact window id from `gdr windows`.
+        #[arg(long)]
+        id: Option<u64>,
+        #[arg(long)]
+        app_id: Option<String>,
+        #[arg(long)]
+        wm_class: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        /// Act on whatever currently has focus.
+        #[arg(long)]
+        focused: bool,
+        #[arg(long)]
+        x: Option<i32>,
+        #[arg(long)]
+        y: Option<i32>,
+        #[arg(long)]
+        width: Option<i32>,
+        #[arg(long)]
+        height: Option<i32>,
+        /// Workspace index for `workspace`.
+        #[arg(long)]
+        index: Option<i32>,
+    },
+
+    /// Poll window open/close/focus events.
+    WindowEvents {
+        /// Resume after this sequence number.
+        #[arg(long, default_value_t = 0)]
+        since: u64,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+        /// Block up to this many ms waiting for the first event.
+        #[arg(long, default_value_t = 0)]
+        wait_ms: u64,
+    },
+
+    /// List installed apps, or launch/raise one.
+    App {
+        /// Desktop-file id to launch. Omit to list.
+        app_id: Option<String>,
+        #[arg(long)]
+        filter: Option<String>,
+    },
+
     /// Print a stored sudo/user password for a host (or a clear "not set" message).
     /// Host may be a positional arg or the global `--host` flag.
     GetPassword {
@@ -349,6 +410,230 @@ fn print_result(json: bool, result: &JsonResult, human_ok: &str) {
     }
 }
 
+/// Handle the window-plane subcommands, or `None` if `cmd` is not one.
+///
+/// These print their own output because a window listing has no useful
+/// projection onto `JsonResult`, which exists to describe one screenshot or
+/// one input event.
+async fn run_window_command(
+    stream: &mut TlsStream<TcpStream>,
+    cmd: &Command,
+    json: bool,
+) -> Result<Option<()>> {
+    let req = match cmd {
+        Command::Windows { filter: _, all } => Request::ListWindows {
+            include_skip_taskbar: *all,
+        },
+        Command::Window {
+            action,
+            id,
+            app_id,
+            wm_class,
+            title,
+            focused,
+            x,
+            y,
+            width,
+            height,
+            index,
+        } => {
+            let target = common::WindowTarget {
+                id: *id,
+                app_id: app_id.clone(),
+                wm_class: wm_class.clone(),
+                title: title.clone(),
+                pid: None,
+                focused: *focused,
+            };
+            Request::WindowAction {
+                target,
+                op: parse_window_op(action, *x, *y, *width, *height, *index)?,
+            }
+        }
+        Command::WindowEvents {
+            since,
+            limit,
+            wait_ms,
+        } => Request::WindowEvents {
+            since: *since,
+            limit: *limit,
+            wait_ms: *wait_ms,
+        },
+        Command::App { app_id, filter } => match app_id {
+            Some(id) => Request::LaunchApp { app_id: id.clone() },
+            None => Request::ListApps {
+                filter: filter.clone(),
+            },
+        },
+        _ => return Ok(None),
+    };
+
+    let resp = run_request(stream, req).await?;
+    print_window_response(cmd, &resp, json)?;
+    if matches!(resp, Response::Error { .. }) {
+        std::process::exit(1);
+    }
+    Ok(Some(()))
+}
+
+fn parse_window_op(
+    action: &str,
+    x: Option<i32>,
+    y: Option<i32>,
+    width: Option<i32>,
+    height: Option<i32>,
+    index: Option<i32>,
+) -> Result<common::WindowOp> {
+    use common::WindowOp as Op;
+    Ok(match action.trim().to_ascii_lowercase().as_str() {
+        "activate" => Op::Activate,
+        "focus" => Op::Focus,
+        "raise" => Op::Raise,
+        "minimize" => Op::Minimize,
+        "unminimize" => Op::Unminimize,
+        "maximize" => Op::Maximize,
+        "unmaximize" => Op::Unmaximize,
+        "fullscreen" => Op::Fullscreen,
+        "unfullscreen" => Op::Unfullscreen,
+        "above" => Op::Above,
+        "unabove" => Op::Unabove,
+        "stick" => Op::Stick,
+        "unstick" => Op::Unstick,
+        "close" => Op::Close,
+        "move" => Op::Move {
+            x: x.context("move needs --x")?,
+            y: y.context("move needs --y")?,
+        },
+        "resize" => Op::Resize {
+            width: width.context("resize needs --width")?,
+            height: height.context("resize needs --height")?,
+        },
+        "move_resize" | "move-resize" => Op::MoveResize {
+            x: x.context("move_resize needs --x")?,
+            y: y.context("move_resize needs --y")?,
+            width: width.context("move_resize needs --width")?,
+            height: height.context("move_resize needs --height")?,
+        },
+        "workspace" => Op::Workspace {
+            index: index.context("workspace needs --index")?,
+        },
+        other => anyhow::bail!("unknown window action '{other}' (see --help)"),
+    })
+}
+
+fn print_window_response(cmd: &Command, resp: &Response, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(resp)?);
+        return Ok(());
+    }
+    match resp {
+        Response::Error { message } => eprintln!("error: {message}"),
+        Response::Windows(list) => {
+            let filter = match cmd {
+                Command::Windows { filter, .. } => filter.as_deref(),
+                _ => None,
+            };
+            let needle = filter.map(|f| f.to_ascii_lowercase());
+            println!(
+                "backend={} capturing={} workspace {}/{}",
+                list.backend.as_str(),
+                list.capture_connector.as_deref().unwrap_or("(unknown)"),
+                list.active_workspace,
+                list.n_workspaces
+            );
+            for w in &list.windows {
+                if let Some(n) = &needle {
+                    let hay = format!(
+                        "{} {} {}",
+                        w.app_id.as_deref().unwrap_or(""),
+                        w.wm_class.as_deref().unwrap_or(""),
+                        w.title.as_deref().unwrap_or("")
+                    )
+                    .to_ascii_lowercase();
+                    if !hay.contains(n) {
+                        continue;
+                    }
+                }
+                println!(
+                    "  {:>6}  ws{:<2} {:<28} {}{}",
+                    w.id,
+                    w.workspace.unwrap_or(-1),
+                    w.app_id
+                        .as_deref()
+                        .or(w.wm_class.as_deref())
+                        .unwrap_or("?"),
+                    w.title.as_deref().unwrap_or(""),
+                    match (w.focus, w.minimized, w.stream_region.is_some()) {
+                        (true, _, _) => "  [focused]",
+                        (_, true, _) => "  [minimized]",
+                        (_, _, false) => "  [not on captured monitor]",
+                        _ => "",
+                    }
+                );
+            }
+        }
+        Response::WindowActed {
+            action,
+            window,
+            detail,
+        } => {
+            println!(
+                "{action} ok: {}",
+                detail
+                    .as_deref()
+                    .or_else(|| window.as_ref().map(|w| w.title.as_deref().unwrap_or("?")))
+                    .unwrap_or("?")
+            );
+        }
+        Response::AppLaunched {
+            app_id,
+            name,
+            was_running,
+        } => println!(
+            "{} {} ({})",
+            if *was_running { "raised" } else { "launched" },
+            name.as_deref().unwrap_or(app_id),
+            app_id
+        ),
+        Response::Apps { apps } => {
+            for a in apps {
+                println!(
+                    "  {:<48} {}{}",
+                    a.app_id,
+                    a.name,
+                    if a.running { "  [running]" } else { "" }
+                );
+            }
+            println!("{} apps", apps.len());
+        }
+        Response::WindowEvents {
+            events,
+            next_seq,
+            dropped,
+            reset,
+        } => {
+            for e in events {
+                println!(
+                    "  #{:<5} {} {:<12} {} {}",
+                    e.seq,
+                    e.at,
+                    e.kind,
+                    e.app_id.as_deref().or(e.wm_class.as_deref()).unwrap_or("?"),
+                    e.title.as_deref().unwrap_or("")
+                );
+            }
+            println!(
+                "{} events, next_seq={next_seq}{}{}",
+                events.len(),
+                if *dropped { " (older events aged out)" } else { "" },
+                if *reset { " (sequence restarted)" } else { "" }
+            );
+        }
+        other => println!("{other:?}"),
+    }
+    Ok(())
+}
+
 fn response_to_result<'a>(
     resp: &Response,
     out_path: Option<&'a str>,
@@ -514,6 +799,12 @@ fn run_host_cmd(cmd: HostCmd, json: bool) -> Result<()> {
                 user_password,
                 label,
                 aliases,
+                // Preserved across a re-add of the same id: the pinned window
+                // belongs to the device, not to whoever last edited it.
+                pinned_window: cfg
+                    .hosts
+                    .get(&name)
+                    .and_then(|p| p.pinned_window.clone()),
             };
             config::upsert_host(&mut cfg, &name, profile);
             if default {
@@ -890,6 +1181,13 @@ async fn main() -> Result<()> {
 
     let mut stream = connect(&host).await?;
 
+    // Window commands answer with structured data that does not fit the flat
+    // JsonResult shape the pixel/input commands share, so they print and
+    // return here rather than being flattened into it.
+    if let Some(()) = run_window_command(&mut stream, &cli.cmd, json).await? {
+        return Ok(());
+    }
+
     let (resp, out_path): (Response, Option<String>) = match &cli.cmd {
         Command::Ping => (run_request(&mut stream, Request::Ping).await?, None),
         Command::Screenshot { out } => (
@@ -947,7 +1245,11 @@ async fn main() -> Result<()> {
         | Command::Pkg { .. }
         | Command::Token { .. }
         | Command::Audit { .. }
-        | Command::GetPassword { .. } => unreachable!(),
+        | Command::GetPassword { .. }
+        | Command::Windows { .. }
+        | Command::Window { .. }
+        | Command::WindowEvents { .. }
+        | Command::App { .. } => unreachable!(),
     };
 
     let result = response_to_result(&resp, out_path.as_deref(), json)?;
