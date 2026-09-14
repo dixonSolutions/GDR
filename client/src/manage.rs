@@ -174,6 +174,8 @@ pub fn run_device(cmd: DeviceCmd, json: bool) -> Result<()> {
                 user_password = Some(rpassword::prompt_password("user password: ")?);
             }
             let prev = cfg.hosts.get(&id).cloned();
+            // Read before the literal: `aliases` below moves `prev`.
+            let pinned_window = prev.as_ref().and_then(|p| p.pinned_window.clone());
             let profile = HostProfile {
                 address: address.clone(),
                 port,
@@ -190,6 +192,10 @@ pub fn run_device(cmd: DeviceCmd, json: bool) -> Result<()> {
                 } else {
                     aliases
                 },
+                // Carried through explicitly: this rebuilds the whole profile,
+                // so a `gdr device add` on an existing id would otherwise
+                // silently drop the pinned window.
+                pinned_window,
             };
             config::upsert_host(&mut cfg, &id, profile);
             if default {

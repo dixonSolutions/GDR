@@ -17,6 +17,12 @@ export interface HostProfile {
   user_password?: string | null;
   label?: string | null;
   aliases?: string[];
+  /**
+   * Default window for this device's window tools — see windowPin.ts.
+   * Typed loosely here so config.ts stays free of window imports; the
+   * shape is `PinnedWindow`.
+   */
+  pinned_window?: Record<string, unknown>;
 }
 
 export interface GdrConfigFile {
@@ -139,6 +145,11 @@ export function upsertDevice(input: DeviceUpsertInput): {
     label: input.label !== undefined ? input.label : (prev?.label ?? null),
     aliases:
       input.aliases !== undefined ? input.aliases : (prev?.aliases ?? []),
+    // Carried forward explicitly: this function rebuilds the profile from
+    // scratch, so anything not named here is silently dropped, and a
+    // `gdr_device_add` that quietly unpinned your window would be a nasty
+    // surprise to debug.
+    ...(prev?.pinned_window ? { pinned_window: prev.pinned_window } : {}),
   };
   cfg.hosts[id] = profile;
   if (input.default) cfg.default_host = id;
@@ -193,6 +204,7 @@ export function devicePublicInfo(query?: string | null): Record<string, unknown>
     has_pin: Boolean(resolved.pin),
     has_sudo: Boolean(resolved.sudo_password),
     has_user: Boolean(resolved.user_password),
+    pinned_window: p?.pinned_window ?? null,
     ssh: p?.ssh ?? null,
     chat: id
       ? `@gdr -dev="${p?.label || id}"`
@@ -346,6 +358,7 @@ export function listDevicesPayload(): unknown {
       has_sudo: Boolean(p.sudo_password),
       has_user: Boolean(p.user_password),
       has_pin: Boolean(p.pin),
+      pinned_window: p.pinned_window ?? null,
       ssh: p.ssh ?? null,
     };
   });

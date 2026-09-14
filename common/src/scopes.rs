@@ -18,14 +18,19 @@ pub enum Scope {
     Keyboard,
     /// Distinct from Keyboard: `TypeText` convenience path.
     Type,
+    /// Enumerate windows, watch them open and close, activate/move/close one,
+    /// and launch installed apps. Deliberately separate from Screenshot: this
+    /// scope reveals *titles*, not pixels, and a token can hold either alone.
+    Window,
 }
 
 impl Scope {
-    pub const ALL: [Scope; 4] = [
+    pub const ALL: [Scope; 5] = [
         Scope::Screenshot,
         Scope::Mouse,
         Scope::Keyboard,
         Scope::Type,
+        Scope::Window,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -34,6 +39,7 @@ impl Scope {
             Scope::Mouse => "mouse",
             Scope::Keyboard => "keyboard",
             Scope::Type => "type",
+            Scope::Window => "window",
         }
     }
 }
@@ -53,6 +59,7 @@ impl FromStr for Scope {
             "mouse" => Ok(Scope::Mouse),
             "keyboard" => Ok(Scope::Keyboard),
             "type" | "type_text" | "typetext" => Ok(Scope::Type),
+            "window" | "windows" => Ok(Scope::Window),
             "all" => Err("use ScopeSet::all() for 'all'".into()),
             other => Err(format!("unknown scope '{other}'")),
         }
@@ -160,6 +167,17 @@ mod tests {
         assert!(s.allows(Some(Scope::Screenshot)));
         assert!(!s.allows(Some(Scope::Type)));
         assert!(s.allows(None)); // Ping
+    }
+
+    #[test]
+    fn window_scope_parses_and_is_in_all() {
+        let s = ScopeSet::parse_list("window").unwrap();
+        assert!(s.contains(Scope::Window));
+        assert!(!s.contains(Scope::Screenshot));
+        // Tokens minted as "all" before the window plane existed must pick
+        // it up, or every existing deployment loses window access on upgrade.
+        assert!(ScopeSet::parse_list("all").unwrap().contains(Scope::Window));
+        assert_eq!(ScopeSet::parse_list("windows").unwrap(), s);
     }
 
     #[test]

@@ -47,6 +47,16 @@ pub struct HostProfile {
     /// Extra names that resolve to this device (case-insensitive).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub aliases: Vec<String>,
+    /// Default window for this device's window commands, set by
+    /// `gdr window pin` / the MCP `gdr_window_pin` tool.
+    ///
+    /// Held as raw JSON rather than a typed struct on purpose: the pin is
+    /// owned by whichever front-end set it, and this crate rewrites the whole
+    /// profile on every `gdr device add`. A typed field would silently drop
+    /// any key it did not know about, which is exactly how a pin set by a
+    /// newer MCP server would vanish the next time the CLI touched config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_window: Option<serde_json::Value>,
 }
 
 fn default_port() -> u16 {
@@ -425,6 +435,7 @@ mod tests {
                 user_password: None,
                 label: Some("home computer".into()),
                 aliases: vec!["home".into()],
+                pinned_window: None,
             },
         );
         cfg
@@ -489,6 +500,28 @@ mod tests {
     }
 
     #[test]
+    fn pinned_window_survives_save_load_with_unknown_keys() {
+        // The pin is written by whichever front-end set it (today the MCP
+        // server), and this crate rewrites the whole profile on `device add`.
+        // Holding it as raw JSON is what keeps a newer writer's fields from
+        // being silently dropped by an older CLI.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut cfg = sample();
+        cfg.hosts.get_mut("laptop").unwrap().pinned_window = Some(serde_json::json!({
+            "id": 42,
+            "app_id": "org.gnome.TextEditor.desktop",
+            "pinned_at": "2026-09-07T10:00:00Z",
+            "a_field_this_crate_never_heard_of": true
+        }));
+        save_to(&path, &cfg).unwrap();
+        let back = load_from(&path).unwrap();
+        let pin = back.hosts["laptop"].pinned_window.as_ref().unwrap();
+        assert_eq!(pin["id"], 42);
+        assert_eq!(pin["a_field_this_crate_never_heard_of"], true);
+    }
+
+    #[test]
     fn resolve_local_profile_no_ip() {
         let mut cfg = Config::default();
         upsert_host(
@@ -504,6 +537,7 @@ mod tests {
                 user_password: None,
                 label: None,
                 aliases: vec![],
+                pinned_window: None,
             },
         );
         let r = resolve(&cfg, Some("local"), None, None, None).unwrap();

@@ -123,6 +123,76 @@ enum Command {
         token_id: Option<String>,
     },
 
+    /// List windows on the target desktop (needs the gdr-windows extension).
+    Windows {
+        /// Only windows whose app id, WM_CLASS or title contains this.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Include docks, panels and notification popups.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Act on one window: activate, minimize, close, move, resize, …
+    Window {
+        /// activate | focus | raise | minimize | unminimize | maximize |
+        /// unmaximize | fullscreen | unfullscreen | above | unabove |
+        /// stick | unstick | close | move | resize | move_resize | workspace
+        action: String,
+        /// Exact window id from `gdr windows`.
+        #[arg(long)]
+        id: Option<u64>,
+        #[arg(long)]
+        app_id: Option<String>,
+        #[arg(long)]
+        wm_class: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        /// Act on whatever currently has focus.
+        #[arg(long)]
+        focused: bool,
+        #[arg(long)]
+        x: Option<i32>,
+        #[arg(long)]
+        y: Option<i32>,
+        #[arg(long)]
+        width: Option<i32>,
+        #[arg(long)]
+        height: Option<i32>,
+        /// Workspace index for `workspace`.
+        #[arg(long)]
+        index: Option<i32>,
+    },
+
+    /// Poll window open/close/focus events.
+    WindowEvents {
+        /// Resume after this sequence number.
+        #[arg(long, default_value_t = 0)]
+        since: u64,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+        /// Block up to this many ms waiting for the first event.
+        #[arg(long, default_value_t = 0)]
+        wait_ms: u64,
+    },
+
+    /// Standing subscriptions: watch screen activity or window lifecycle.
+    Hook {
+        #[command(subcommand)]
+        cmd: HookCmd,
+    },
+
+    /// Shorthand for `gdr hook list`.
+    Hooks,
+
+    /// List installed apps, or launch/raise one.
+    App {
+        /// Desktop-file id to launch. Omit to list.
+        app_id: Option<String>,
+        #[arg(long)]
+        filter: Option<String>,
+    },
+
     /// Print a stored sudo/user password for a host (or a clear "not set" message).
     /// Host may be a positional arg or the global `--host` flag.
     GetPassword {
@@ -131,6 +201,114 @@ enum Command {
         /// Host profile name (default_host if omitted).
         #[arg(value_name = "HOST")]
         name: Option<String>,
+    },
+}
+
+/// Subscription hooks. `screen` and `window` create one; the rest manage
+/// what is already there.
+#[derive(Subcommand, Debug, Clone)]
+enum HookCmd {
+    /// Watch the screen — or one window — for activity, reported as a circle.
+    Screen {
+        /// Watch only this window (tracks it as it moves).
+        #[arg(long)]
+        id: Option<u64>,
+        #[arg(long)]
+        app_id: Option<String>,
+        #[arg(long)]
+        wm_class: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        /// Watch a fixed rectangle of stream pixels: x,y,width,height.
+        #[arg(long, value_name = "X,Y,W,H")]
+        region: Option<String>,
+        /// Quiet period before a burst is reported, in ms.
+        #[arg(long, default_value_t = common::hooks::ACTIVITY_BUFFER_MS)]
+        buffer_ms: u64,
+        /// Never report more often than this, in ms. 0 = off. For regions
+        /// that repaint on a timer, where every repaint is its own burst.
+        #[arg(long, default_value_t = 0)]
+        min_interval_ms: u64,
+        #[arg(long, default_value_t = common::hooks::ACTIVITY_POLL_MS)]
+        poll_ms: u64,
+        /// Report a still-moving burst anyway after this long. 0 disables.
+        #[arg(long, default_value_t = common::hooks::ACTIVITY_MAX_BURST_MS)]
+        max_burst_ms: u64,
+        /// Per-cell luma delta that counts as change (1-255).
+        #[arg(long, default_value_t = 12)]
+        threshold: u8,
+        /// Cells that must change before a sample counts as activity.
+        #[arg(long, default_value_t = 1)]
+        min_cells: u32,
+        /// Diff grid resolution along the long edge.
+        #[arg(long, default_value_t = 64)]
+        grid: u32,
+        /// Ignore bursts whose circle is bigger than this radius, in px.
+        #[arg(long, default_value_t = 0)]
+        max_radius: u32,
+        #[arg(long)]
+        label: Option<String>,
+        /// Create it switched off.
+        #[arg(long)]
+        off: bool,
+    },
+
+    /// Watch windows opening, closing, resizing and more.
+    Window {
+        /// Comma-separated: opened,closed,resized,moved,retitled,focused,
+        /// minimized,unminimized,workspace
+        #[arg(long, default_value = "opened,closed,resized")]
+        events: String,
+        /// Watch only windows matching this selector.
+        #[arg(long)]
+        id: Option<u64>,
+        #[arg(long)]
+        app_id: Option<String>,
+        #[arg(long)]
+        wm_class: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        /// Quiet period before a geometry change is reported, in ms.
+        #[arg(long, default_value_t = common::hooks::WINDOW_BUFFER_MS)]
+        buffer_ms: u64,
+        #[arg(long, default_value_t = common::hooks::WINDOW_POLL_MS)]
+        poll_ms: u64,
+        #[arg(long, default_value_t = common::hooks::WINDOW_MAX_BURST_MS)]
+        max_burst_ms: u64,
+        /// Include docks, panels and notification popups.
+        #[arg(long)]
+        all: bool,
+        /// Skip the /proc lookup for the owning process.
+        #[arg(long)]
+        no_process: bool,
+        #[arg(long)]
+        label: Option<String>,
+        /// Create it switched off.
+        #[arg(long)]
+        off: bool,
+    },
+
+    /// Show every hook this token may see.
+    List,
+    /// Switch one on.
+    On { id: String },
+    /// Switch one off, keeping its config and buffered events.
+    Off { id: String },
+    /// Forget one, dropping its buffered events.
+    Remove { id: String },
+    /// Drain the hook journal.
+    Events {
+        /// Only this hook. Omit to drain every hook at once.
+        #[arg(long)]
+        id: Option<String>,
+        /// Resume after this sequence number.
+        #[arg(long, default_value_t = 0)]
+        since: u64,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+        /// Block up to this many ms for the first event.
+        #[arg(long, default_value_t = 0)]
+        wait_ms: u64,
     },
 }
 
@@ -349,6 +527,448 @@ fn print_result(json: bool, result: &JsonResult, human_ok: &str) {
     }
 }
 
+/// Handle the window-plane subcommands, or `None` if `cmd` is not one.
+///
+/// These print their own output because a window listing has no useful
+/// projection onto `JsonResult`, which exists to describe one screenshot or
+/// one input event.
+async fn run_window_command(
+    stream: &mut TlsStream<TcpStream>,
+    cmd: &Command,
+    json: bool,
+) -> Result<Option<()>> {
+    let req = match cmd {
+        Command::Windows { filter: _, all } => Request::ListWindows {
+            include_skip_taskbar: *all,
+        },
+        Command::Window {
+            action,
+            id,
+            app_id,
+            wm_class,
+            title,
+            focused,
+            x,
+            y,
+            width,
+            height,
+            index,
+        } => {
+            let target = common::WindowTarget {
+                id: *id,
+                app_id: app_id.clone(),
+                wm_class: wm_class.clone(),
+                title: title.clone(),
+                pid: None,
+                focused: *focused,
+            };
+            Request::WindowAction {
+                target,
+                op: parse_window_op(action, *x, *y, *width, *height, *index)?,
+            }
+        }
+        Command::WindowEvents {
+            since,
+            limit,
+            wait_ms,
+        } => Request::WindowEvents {
+            since: *since,
+            limit: *limit,
+            wait_ms: *wait_ms,
+        },
+        Command::App { app_id, filter } => match app_id {
+            Some(id) => Request::LaunchApp { app_id: id.clone() },
+            None => Request::ListApps {
+                filter: filter.clone(),
+            },
+        },
+        Command::Hooks => Request::HookList,
+        Command::Hook { cmd } => hook_request(cmd)?,
+        _ => return Ok(None),
+    };
+
+    let resp = run_request(stream, req).await?;
+    print_window_response(cmd, &resp, json)?;
+    if matches!(resp, Response::Error { .. }) {
+        std::process::exit(1);
+    }
+    Ok(Some(()))
+}
+
+/// Turn a `gdr hook …` invocation into one protocol request.
+fn hook_request(cmd: &HookCmd) -> Result<Request> {
+    use common::hooks::{ActivitySpec, HookSpec, WindowHookSpec};
+
+    fn target(
+        id: Option<u64>,
+        app_id: &Option<String>,
+        wm_class: &Option<String>,
+        title: &Option<String>,
+    ) -> Option<common::WindowTarget> {
+        if id.is_none() && app_id.is_none() && wm_class.is_none() && title.is_none() {
+            return None;
+        }
+        Some(common::WindowTarget {
+            id,
+            app_id: app_id.clone(),
+            wm_class: wm_class.clone(),
+            title: title.clone(),
+            pid: None,
+            focused: false,
+        })
+    }
+
+    Ok(match cmd {
+        HookCmd::Screen {
+            id,
+            app_id,
+            wm_class,
+            title,
+            region,
+            buffer_ms,
+            min_interval_ms,
+            poll_ms,
+            max_burst_ms,
+            threshold,
+            min_cells,
+            grid,
+            max_radius,
+            label,
+            off,
+        } => {
+            let region = match region {
+                None => None,
+                Some(spec) => {
+                    let nums: Vec<u32> = spec
+                        .split(',')
+                        .map(|p| p.trim().parse::<u32>())
+                        .collect::<Result<_, _>>()
+                        .context("--region takes four numbers: x,y,width,height")?;
+                    if nums.len() != 4 {
+                        anyhow::bail!("--region takes four numbers: x,y,width,height");
+                    }
+                    Some(common::Region {
+                        x: nums[0],
+                        y: nums[1],
+                        width: nums[2],
+                        height: nums[3],
+                    })
+                }
+            };
+            Request::HookCreate {
+                spec: HookSpec::Activity(ActivitySpec {
+                    target: target(*id, app_id, wm_class, title),
+                    region,
+                    buffer_ms: *buffer_ms,
+                    min_interval_ms: *min_interval_ms,
+                    max_burst_ms: *max_burst_ms,
+                    poll_ms: *poll_ms,
+                    threshold: *threshold,
+                    min_cells: *min_cells,
+                    grid: *grid,
+                    max_radius: *max_radius,
+                }),
+                label: label.clone(),
+                enabled: !off,
+            }
+        }
+        HookCmd::Window {
+            events,
+            id,
+            app_id,
+            wm_class,
+            title,
+            buffer_ms,
+            poll_ms,
+            max_burst_ms,
+            all,
+            no_process,
+            label,
+            off,
+        } => Request::HookCreate {
+            spec: HookSpec::Window(WindowHookSpec {
+                target: target(*id, app_id, wm_class, title),
+                events: events
+                    .split(',')
+                    .map(|e| e.trim().to_string())
+                    .filter(|e| !e.is_empty())
+                    .collect(),
+                buffer_ms: *buffer_ms,
+                max_burst_ms: *max_burst_ms,
+                poll_ms: *poll_ms,
+                include_skip_taskbar: *all,
+                geometry_threshold: 2,
+                include_process: !no_process,
+            }),
+            label: label.clone(),
+            enabled: !off,
+        },
+        HookCmd::List => Request::HookList,
+        HookCmd::On { id } => Request::HookUpdate {
+            id: id.clone(),
+            enabled: Some(true),
+            label: None,
+            spec: None,
+        },
+        HookCmd::Off { id } => Request::HookUpdate {
+            id: id.clone(),
+            enabled: Some(false),
+            label: None,
+            spec: None,
+        },
+        HookCmd::Remove { id } => Request::HookRemove { id: id.clone() },
+        HookCmd::Events {
+            id,
+            since,
+            limit,
+            wait_ms,
+        } => Request::HookPoll {
+            id: id.clone(),
+            since: *since,
+            limit: *limit,
+            wait_ms: *wait_ms,
+        },
+    })
+}
+
+fn parse_window_op(
+    action: &str,
+    x: Option<i32>,
+    y: Option<i32>,
+    width: Option<i32>,
+    height: Option<i32>,
+    index: Option<i32>,
+) -> Result<common::WindowOp> {
+    use common::WindowOp as Op;
+    Ok(match action.trim().to_ascii_lowercase().as_str() {
+        "activate" => Op::Activate,
+        "focus" => Op::Focus,
+        "raise" => Op::Raise,
+        "minimize" => Op::Minimize,
+        "unminimize" => Op::Unminimize,
+        "maximize" => Op::Maximize,
+        "unmaximize" => Op::Unmaximize,
+        "fullscreen" => Op::Fullscreen,
+        "unfullscreen" => Op::Unfullscreen,
+        "above" => Op::Above,
+        "unabove" => Op::Unabove,
+        "stick" => Op::Stick,
+        "unstick" => Op::Unstick,
+        "close" => Op::Close,
+        "move" => Op::Move {
+            x: x.context("move needs --x")?,
+            y: y.context("move needs --y")?,
+        },
+        "resize" => Op::Resize {
+            width: width.context("resize needs --width")?,
+            height: height.context("resize needs --height")?,
+        },
+        "move_resize" | "move-resize" => Op::MoveResize {
+            x: x.context("move_resize needs --x")?,
+            y: y.context("move_resize needs --y")?,
+            width: width.context("move_resize needs --width")?,
+            height: height.context("move_resize needs --height")?,
+        },
+        "workspace" => Op::Workspace {
+            index: index.context("workspace needs --index")?,
+        },
+        other => anyhow::bail!("unknown window action '{other}' (see --help)"),
+    })
+}
+
+fn print_window_response(cmd: &Command, resp: &Response, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(resp)?);
+        return Ok(());
+    }
+    match resp {
+        Response::Error { message } => eprintln!("error: {message}"),
+        Response::Windows(list) => {
+            let filter = match cmd {
+                Command::Windows { filter, .. } => filter.as_deref(),
+                _ => None,
+            };
+            let needle = filter.map(|f| f.to_ascii_lowercase());
+            println!(
+                "backend={} capturing={} workspace {}/{}",
+                list.backend.as_str(),
+                list.capture_connector.as_deref().unwrap_or("(unknown)"),
+                list.active_workspace,
+                list.n_workspaces
+            );
+            for w in &list.windows {
+                if let Some(n) = &needle {
+                    let hay = format!(
+                        "{} {} {}",
+                        w.app_id.as_deref().unwrap_or(""),
+                        w.wm_class.as_deref().unwrap_or(""),
+                        w.title.as_deref().unwrap_or("")
+                    )
+                    .to_ascii_lowercase();
+                    if !hay.contains(n) {
+                        continue;
+                    }
+                }
+                println!(
+                    "  {:>6}  ws{:<2} {:<28} {}{}",
+                    w.id,
+                    w.workspace.unwrap_or(-1),
+                    w.app_id
+                        .as_deref()
+                        .or(w.wm_class.as_deref())
+                        .unwrap_or("?"),
+                    w.title.as_deref().unwrap_or(""),
+                    match (w.focus, w.minimized, w.stream_region.is_some()) {
+                        (true, _, _) => "  [focused]",
+                        (_, true, _) => "  [minimized]",
+                        (_, _, false) => "  [not on captured monitor]",
+                        _ => "",
+                    }
+                );
+            }
+        }
+        Response::WindowActed {
+            action,
+            window,
+            detail,
+        } => {
+            println!(
+                "{action} ok: {}",
+                detail
+                    .as_deref()
+                    .or_else(|| window.as_ref().map(|w| w.title.as_deref().unwrap_or("?")))
+                    .unwrap_or("?")
+            );
+        }
+        Response::AppLaunched {
+            app_id,
+            name,
+            was_running,
+        } => println!(
+            "{} {} ({})",
+            if *was_running { "raised" } else { "launched" },
+            name.as_deref().unwrap_or(app_id),
+            app_id
+        ),
+        Response::Apps { apps } => {
+            for a in apps {
+                println!(
+                    "  {:<48} {}{}",
+                    a.app_id,
+                    a.name,
+                    if a.running { "  [running]" } else { "" }
+                );
+            }
+            println!("{} apps", apps.len());
+        }
+        Response::WindowEvents {
+            events,
+            next_seq,
+            dropped,
+            reset,
+        } => {
+            for e in events {
+                println!(
+                    "  #{:<5} {} {:<12} {} {}",
+                    e.seq,
+                    e.at,
+                    e.kind,
+                    e.app_id.as_deref().or(e.wm_class.as_deref()).unwrap_or("?"),
+                    e.title.as_deref().unwrap_or("")
+                );
+            }
+            println!(
+                "{} events, next_seq={next_seq}{}{}",
+                events.len(),
+                if *dropped { " (older events aged out)" } else { "" },
+                if *reset { " (sequence restarted)" } else { "" }
+            );
+        }
+        Response::Hook { hook } => print_hooks(std::slice::from_ref(hook.as_ref())),
+        Response::Hooks { hooks } => print_hooks(hooks),
+        Response::HookEvents(result) => {
+            for e in &result.events {
+                let what = match (&e.activity, &e.window) {
+                    (Some(a), _) => format!(
+                        "circle ({:.0},{:.0}) r={:.0}  {}x{} box  {}",
+                        a.circle.x,
+                        a.circle.y,
+                        a.circle.radius,
+                        a.bbox.width,
+                        a.bbox.height,
+                        if a.settled { "settled" } else { "STILL MOVING" }
+                    ),
+                    (_, Some(w)) => format!(
+                        "{:<30} {}x{}+{}+{}  pid {}{}",
+                        w.title.as_deref().unwrap_or(w.app_id.as_deref().unwrap_or("?")),
+                        w.frame_rect.width,
+                        w.frame_rect.height,
+                        w.frame_rect.x,
+                        w.frame_rect.y,
+                        w.pid,
+                        w.process
+                            .as_ref()
+                            .and_then(|p| p.comm.clone())
+                            .map(|c| format!(" ({c})"))
+                            .unwrap_or_default()
+                    ),
+                    _ => String::new(),
+                };
+                println!(
+                    "  #{:<5} {} {:<12} {:<14} {}",
+                    e.seq, e.at, e.hook_id, e.kind, what
+                );
+            }
+            println!(
+                "{} events, next_seq={}{}",
+                result.events.len(),
+                result.next_seq,
+                if result.dropped {
+                    " (older events aged out — poll more often)"
+                } else {
+                    ""
+                }
+            );
+            print_hooks(&result.hooks);
+        }
+        other => println!("{other:?}"),
+    }
+    Ok(())
+}
+
+fn print_hooks(hooks: &[common::HookStatus]) {
+    if hooks.is_empty() {
+        println!("no hooks");
+        return;
+    }
+    for h in hooks {
+        println!(
+            "  {:<12} {:<8} {:<9} scope={:<10} {}{}",
+            h.id,
+            if h.enabled { "on" } else { "off" },
+            h.state.as_str(),
+            h.required_scope,
+            h.summary,
+            h.label
+                .as_deref()
+                .map(|l| format!("  '{l}'"))
+                .unwrap_or_default()
+        );
+        if let Some(err) = &h.last_error {
+            println!("               ! {err}");
+        }
+        println!(
+            "               {} events emitted, {} buffered{}",
+            h.events_emitted,
+            h.buffered,
+            h.last_event_at
+                .as_deref()
+                .map(|t| format!(", last {t}"))
+                .unwrap_or_default()
+        );
+    }
+}
+
 fn response_to_result<'a>(
     resp: &Response,
     out_path: Option<&'a str>,
@@ -514,6 +1134,12 @@ fn run_host_cmd(cmd: HostCmd, json: bool) -> Result<()> {
                 user_password,
                 label,
                 aliases,
+                // Preserved across a re-add of the same id: the pinned window
+                // belongs to the device, not to whoever last edited it.
+                pinned_window: cfg
+                    .hosts
+                    .get(&name)
+                    .and_then(|p| p.pinned_window.clone()),
             };
             config::upsert_host(&mut cfg, &name, profile);
             if default {
@@ -890,6 +1516,13 @@ async fn main() -> Result<()> {
 
     let mut stream = connect(&host).await?;
 
+    // Window commands answer with structured data that does not fit the flat
+    // JsonResult shape the pixel/input commands share, so they print and
+    // return here rather than being flattened into it.
+    if let Some(()) = run_window_command(&mut stream, &cli.cmd, json).await? {
+        return Ok(());
+    }
+
     let (resp, out_path): (Response, Option<String>) = match &cli.cmd {
         Command::Ping => (run_request(&mut stream, Request::Ping).await?, None),
         Command::Screenshot { out } => (
@@ -947,7 +1580,13 @@ async fn main() -> Result<()> {
         | Command::Pkg { .. }
         | Command::Token { .. }
         | Command::Audit { .. }
-        | Command::GetPassword { .. } => unreachable!(),
+        | Command::GetPassword { .. }
+        | Command::Windows { .. }
+        | Command::Window { .. }
+        | Command::WindowEvents { .. }
+        | Command::Hook { .. }
+        | Command::Hooks
+        | Command::App { .. } => unreachable!(),
     };
 
     let result = response_to_result(&resp, out_path.as_deref(), json)?;

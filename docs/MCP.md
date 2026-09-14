@@ -81,14 +81,16 @@ Claude Desktop’s config when found.
 
 | Tool | Args | Notes |
 |---|---|---|
-| `gdr_screenshot` / `gnome_screenshot` | `host?`, `layout?` | Default `layout=agent` downscales to ≤1440×900 and returns geometry JSON + PNG; `raw` is 1:1 native |
+| `gdr_screenshot` / `gnome_screenshot` | `host?`, `profile?`, `settle?`, `skip_unchanged?`, `layout?` | Sizes for the model's token budget, returns geometry JSON + image. `settle` off by default |
+| `gdr_zoom` | `host?`, `x`, `y`, `width`, `height`, `space?`, `settle?` | Crop at **native** resolution. Use for anything under ~20px. `space:"stream"` takes capture-stream coordinates (what hooks report) and needs no prior screenshot; the default `"image"` takes the last screenshot's pixels |
+| `gdr_act` | `host?`, `steps[]`, `expect_change?`, `profile?`, `settle?`, `screenshot?` | Actions **and** the resulting screenshot in one round trip. Settles by default |
 | `gdr_click` / `gnome_click` | `host?`, `x`, `y`, `button?`, `clicks?` | `x,y` in latest screenshot image space; remapped to stream pixels. Requires a prior screenshot. `clicks=2` = double-click |
 | `gdr_double_click` | `host?`, `x`, `y`, `button?` | shorthand |
 | `gdr_move` / `gnome_move` | `host?`, `x`, `y` | same image-space remap as click; updates tracked cursor |
 | `gdr_cursor` | `host?` | last known `{x,y,known}` from gdr moves |
 | `gdr_key` / `gnome_key` | `host?`, `key`/`keycode`, `modifiers?` | names or evdev; mods held for tap |
 | `gdr_hotkey` | `host?`, `keys` | `"Alt+F4"`, `"Super+PageDown"` |
-| `gdr_input` | `host?`, `steps[]` | flexible ordered sequence (see below) |
+| `gdr_input` | `host?`, `steps[]` | flexible ordered sequence, no screenshot (see below) |
 | `gdr_type` / `gnome_type` | `host?`, `text` | ASCII MVP |
 | `gdr_ping` / `gnome_ping` | `host?` | |
 | `gdr_status` | `host?` / `dev?` | Resolve device + Ping; `auth: valid\|failed` (no secrets) |
@@ -97,9 +99,66 @@ Claude Desktop’s config when found.
 | `gdr_device_remove` | `dev` | Remove profile by id/label/alias |
 | `gdr_device_default` | `dev` | Set `default_host` |
 | `gdr_get_password` | `host?`/`dev?`, `kind: sudo\|user` | see below |
+| `gdr_hook_screen` / `gdr_hook_window` / `gdr_hooks` / `gdr_hook_events` | see [Subscription hooks](#subscription-hooks) | Standing watches on screen activity and window lifecycle |
+
+### Window tools
+
+These need the `gdr-windows` GNOME Shell extension on the target and the
+`window` token scope — see [WINDOWS.md](./WINDOWS.md), which also explains why
+an extension is unavoidable on GNOME 50 and why a window screenshot activates
+the window first.
+
+Every tool below takes the same selector (`id`, `app_id`, `wm_class`, `title`,
+`pid`, `focused`), combined with AND. With no selector they fall back to the
+device's **pinned window**, then to whatever has focus, and the result says
+which (`source: "explicit" | "pin" | "focused"`).
+
+| Tool | Key args | Notes |
+|---|---|---|
+| `gdr_windows` | `filter?`, `include_skip_taskbar?`, `log?` | Start here. Lists windows, monitors, the captured connector, and the event `seq` |
+| `gdr_window_info` | selector | Full state of one window; use it to check a pin still resolves |
+| `gdr_window_control` | selector, `action`, `x/y/width/height/index?` | activate, minimize, maximize, move, resize, workspace, close |
+| `gdr_window_screenshot` | selector, `activate?`, `profile?` | Crops to one window. Activates first by default — Wayland has no per-window buffer |
+| `gdr_window_act` | selector, `steps[]`, `activate?` | Activate + drive + capture the window, in one round trip |
+| `gdr_window_events` | `since`, `limit?`, `wait_ms?`, `log?` | Open/close/focus journal. `wait_ms>0` blocks instead of polling |
+| `gdr_window_pin` | selector, `clear?`, `label?`, `note?` | Set / show / wipe the per-device default window |
+| `gdr_window_log` | `tail?`, `kind?`, `since?` | Controller-side log of pins, actions and observed events |
+| `gdr_app_launch` | `app_id?`, `list?`, `filter?` | Launch or raise an app — how to reach a window that is not open at all |
+
+A selector matching several windows is an error carrying the candidates, not
+an arbitrary pick.
 
 Every control tool accepts **`host`** or **`dev`** (same meaning): device id,
 label (`"home computer"`), or alias.
+
+### Subscription hooks
+
+Standing watches gdrd runs between requests, instead of the agent
+screenshotting in a loop. Full story — buffer time, why activity is a circle,
+what an enabled activity hook costs — in [HOOKS.md](./HOOKS.md).
+
+| Tool | Key args | Notes |
+|---|---|---|
+| `gdr_hook_screen` | selector or `region?`, `buffer_ms?`, `poll_ms?`, `threshold?`, `max_radius?`, `id?` | Watch the screen, a rectangle, or one window. Reports a circle. Needs `screenshot` |
+| `gdr_hook_window` | `events[]`, selector, `buffer_ms?`, `poll_ms?`, `include_process?`, `id?` | opened/closed/resized/moved/retitled/… with title, size and owning process. Needs `window` |
+| `gdr_hooks` | `action: list\|enable\|disable\|remove`, `id?` | The toggle. Disabling keeps config and buffered events |
+| `gdr_hook_events` | `id?`, `since`, `limit?`, `wait_ms?` | One cursor drains every hook. `wait_ms>0` blocks instead of polling |
+
+Pass `id=` to the two creation tools to reconfigure an existing hook in place
+rather than ending up with two watching the same thing.
+
+Activity circles come back in capture-stream pixels **and**, when a screenshot
+for that device exists, in that image's coordinate space — the one
+`gdr_click` takes:
+
+```json
+"circle": { "x": 1465, "y": 612, "radius": 93, "space": "stream" },
+"circle_in_last_screenshot": { "x": 1068, "y": 446, "radius": 68 }
+```
+
+An enabled activity hook holds the desktop capture open (see
+[Privacy / idle disconnect](#privacy--idle-disconnect)) — switch it off when
+you are done watching.
 
 ### Flexible keyboard: `gdr_hotkey` + `gdr_input`
 
@@ -138,18 +197,74 @@ via tool args are rejected by design.
 Connections are pooled per profile and serialized (one in-flight request
 per client) so screenshot→click loops stay on one Mutter session.
 
-### Screenshot layout → click remap
+### Driving the desktop efficiently
 
-MCP keeps per-device frame geometry from the last `gdr_screenshot`. Click/move
-coords are mapped from image pixels back to Mutter stream pixels (clamped to
-`[0, native-1]`). Calling `gdr_click` / `gdr_move` before any screenshot for
-that device errors loudly (`no screenshot geometry…`) instead of silently
-treating coords as native.
+The loop is dominated by model inference (~5 s per round trip), not by gdrd
+(~50 ms). Optimise for **fewer observations**, not faster ones. See
+[PERFORMANCE.md](PERFORMANCE.md) for the full reasoning.
 
-Geometry is only replaced on the next screenshot — re-screenshot after
-resize, workspace switch, or monitor change. Native PNG size must match the
-PipeWire buffer for the ScreenCast stream node (true by construction in
-gdrd today: same keepalive appsink).
+1. **`gdr_act` instead of act-then-screenshot.** One call runs a sequence and
+   returns the resulting screenshot. Best for self-contained sequences (form
+   fills, keyboard chains, clicking a known target). For exploratory
+   navigation, keep observing between steps.
+2. **`gdr_zoom` for small targets.** Below ~20px, a full screenshot does not
+   have the pixels to aim with. Zoom rather than guessing and retrying — the
+   guess-and-retry loop is the single most expensive failure mode there is.
+3. **Don't add `delay_ms` before capturing.** Screenshots wait for the
+   compositor to stop repainting by default, which is both faster and more
+   reliable than a guessed delay.
+4. **`skip_unchanged: true`** when you only need to know whether something
+   happened. An identical screen returns a short note and no image.
+
+```json
+{
+  "steps": [
+    { "hotkey": "Super" },
+    { "type": "text editor" },
+    { "tap": "Enter" }
+  ],
+  "expect_change": true
+}
+```
+
+### Sizing profiles
+
+`profile` picks the sizing target; `layout` is the older, coarser knob
+(`agent` → `claude`, `raw` → `raw`).
+
+| Profile | Fit | Use when |
+|---|---|---|
+| `claude` (default) | ≤1568 visual tokens | Claude Sonnet 4.6 / standard tier |
+| `claude-hires` | ≤4784 visual tokens | Claude 4.7+ high-resolution tier |
+| `openai` | 1440×900 | OpenAI computer-use models |
+| `raw` | native, 1:1 | Pixel work, debugging |
+
+Sizing over a model's token budget makes its API silently downscale the image
+*again*, after which every coordinate it returns is in a space the remap
+knows nothing about. `visual_tokens` in the returned metadata is the billed
+cost, so it is easy to confirm you are under the cap.
+
+### Frame geometry → click remap
+
+MCP keeps per-device geometry from the last capture. Click/move coords are
+mapped from image pixels back to Mutter stream pixels, clamped to
+`[0, native-1]`.
+
+**One rule: coordinates are always read off the most recent image for that
+device.** That holds for zooms too — the crop origin and scale are folded
+into the remap, so clicking the centre of a 400×300 zoom taken at +1000,+700
+lands at native (1200, 850). Nothing special to track.
+
+Two failures are made loud rather than silent:
+
+- Clicking before any screenshot → `no screenshot geometry…`.
+- Coordinates outside the last image (classically: zooming in, then sending
+  full-desktop coords) → an error naming the zoom region. Extrapolating would
+  click somewhere plausible but wrong.
+
+Geometry is only replaced on the next capture — re-screenshot after a resize,
+workspace switch, monitor change, or after a zoom if you want to click
+elsewhere.
 
 ## `gdr_get_password` — intentional tradeoff
 
@@ -181,6 +296,13 @@ socket open. gdrd itself tears down physical ScreenCast after
 
 Prefer a **single** `gdr` MCP entry (not `--per-device`) so you do not
 run three idle Node processes.
+
+**An enabled activity hook is the deliberate exception.** It holds the capture
+session open for as long as it is switched on, because a watcher that the idle
+teardown kills is not watching. That means the desktop is being streamed
+continuously — visible to whoever is at the machine — until the hook is
+disabled or removed. Window hooks do not touch the capture stream at all; they
+are metadata only. See [HOOKS.md](./HOOKS.md).
 
 ## Locked screen
 

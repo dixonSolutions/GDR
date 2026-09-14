@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Task 1 — Turn every shape red</title>
+    <link rel="stylesheet" href="/task.css" />
+    <style>
+      /* Fixed-size board so the whole task fits one viewport: scrolling would
+       * add a confound to what is meant to be a pure aiming measurement. */
+      #board {
+        position: relative;
+        height: 620px;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+        overflow: hidden;
+      }
+      .shape {
+        position: absolute;
+        cursor: pointer;
+        transition: background-color 120ms ease;
+      }
+      .shape.circle {
+        border-radius: 50%;
+      }
+      .shape.square {
+        border-radius: 4px;
+      }
+      /* A CSS triangle has no background box, so it is coloured with
+       * border-bottom-color and handled separately when turning red. */
+      .shape.triangle {
+        width: 0 !important;
+        height: 0 !important;
+        background: transparent !important;
+        border-left-style: solid;
+        border-right-style: solid;
+        border-bottom-style: solid;
+        border-left-color: transparent;
+        border-right-color: transparent;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="task-bar">
+      <div>
+        <h1>Task 1 — Turn every shape red</h1>
+        <p class="goal">Click each shape that is not already red. Clicking a shape turns it red.</p>
+      </div>
+      <div class="status" id="status">0 / 0 red</div>
+    </header>
+
+    <main>
+      <div id="board"></div>
+      <div class="done-banner"></div>
+      <p class="muted" id="tally">Clicks: 0 · misses: 0</p>
+    </main>
+
+    <script type="module">
+      import { rng, seedFromUrl, start, complete, progress, publish } from "/task.js";
+
+      const TASK = "shapes";
+      const seed = seedFromUrl(11);
+      const rand = rng(seed);
+
+      const RED = "#dc2626";
+      const PALETTE = ["#2563eb", "#0d9488", "#7c3aed", "#d97706", "#0891b2", "#4d7c0f"];
+      const KINDS = ["circle", "square", "triangle"];
+      const COUNT = 18;
+
+      const board = document.getElementById("board");
+      const statusEl = document.getElementById("status");
+      const tallyEl = document.getElementById("tally");
+
+      let clicks = 0;
+      let misses = 0;
+      let done = false;
+
+      /**
+       * Lay shapes out without overlap.
+       *
+       * Overlapping targets would make a "miss" ambiguous — we could not tell a
+       * bad aim from a shape hidden underneath another one.
+       */
+      function place(size) {
+        for (let attempt = 0; attempt < 400; attempt++) {
+          const x = 16 + rand() * (board.clientWidth - size - 32);
+          const y = 16 + rand() * (620 - size - 32);
+          const clash = shapes.some(
+            (s) =>
+              x < s.x + s.size + 14 &&
+              x + size + 14 > s.x &&
+              y < s.y + s.size + 14 &&
+              y + size + 14 > s.y
+          );
+          if (!clash) return { x, y };
+        }
+        return null;
+      }
+
+      const shapes = [];
+
+      for (let i = 0; i < COUNT; i++) {
+        // Sizes deliberately span a wide range: the small end is where naive
+        // full-desktop screenshots lose the target and zooming pays off.
+        const size = Math.round(26 + rand() * 54);
+        const spot = place(size);
+        if (!spot) continue;
+        const kind = KINDS[Math.floor(rand() * KINDS.length)];
+        // A third start red, so the task requires discrimination rather than
+        // just clicking everything on the board.
+        const isRed = rand() < 0.33;
+        const colour = isRed ? RED : PALETTE[Math.floor(rand() * PALETTE.length)];
+
+        const el = document.createElement("div");
+        el.className = `shape ${kind}`;
+        el.style.left = `${Math.round(spot.x)}px`;
+        el.style.top = `${Math.round(spot.y)}px`;
+        el.dataset.index = String(shapes.length);
+
+        if (kind === "triangle") {
+          el.style.borderLeftWidth = `${Math.round(size / 2)}px`;
+          el.style.borderRightWidth = `${Math.round(size / 2)}px`;
+          el.style.borderBottomWidth = `${size}px`;
+          el.style.borderBottomColor = colour;
+        } else {
+          el.style.width = `${size}px`;
+          el.style.height = `${size}px`;
+          el.style.background = colour;
+        }
+
+        board.appendChild(el);
+        shapes.push({ el, kind, size, x: spot.x, y: spot.y, red: isRed });
+      }
+
+      const target = shapes.length;
+      // Fewest clicks that can finish this board, fixed before any input.
+      const optimalClicks = shapes.filter((s) => !s.red).length;
+
+      function redCount() {
+        return shapes.filter((s) => s.red).length;
+      }
+
+      function refresh() {
+        statusEl.textContent = `${redCount()} / ${target} red`;
+        tallyEl.textContent = `Clicks: ${clicks} · misses: ${misses}`;
+        publish({
+          task: TASK,
+          seed,
+          total: target,
+          red: redCount(),
+          clicks,
+          misses,
+          done,
+        });
+      }
+
+      board.addEventListener("click", (ev) => {
+        if (done) return;
+        clicks += 1;
+        const el = ev.target.closest(".shape");
+
+        if (!el) {
+          // Landed on empty board: the clearest possible signal of bad aim.
+          misses += 1;
+          progress(TASK, { event: "miss", x: ev.offsetX, y: ev.offsetY });
+          refresh();
+          return;
+        }
+
+        const shape = shapes[Number(el.dataset.index)];
+        if (shape.red) {
+          // Hitting an already-red shape is wasted effort, not a miss.
+          misses += 1;
+          progress(TASK, { event: "redundant", index: el.dataset.index });
+          refresh();
+          return;
+        }
+
+        shape.red = true;
+        if (shape.kind === "triangle") el.style.borderBottomColor = RED;
+        else el.style.background = RED;
+        progress(TASK, { event: "turned", index: el.dataset.index, red: redCount() });
+        refresh();
+
+        if (redCount() === target) {
+          done = true;
+          // Efficiency is judged against the clicks the board actually
+          // required, so a board that starts mostly red is not scored as if it
+          // were mostly blue.
+          complete(TASK, {
+            success: true,
+            score: Math.min(1, optimalClicks / Math.max(clicks, 1)),
+            detail: { clicks, misses, optimal: optimalClicks, total: target },
+          });
+          refresh();
+        }
+      });
+
+      start(TASK, { seed, shapes: target, optimal_clicks: optimalClicks });
+      refresh();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Task 4 — Collect the slide codes</title>
+    <link rel="stylesheet" href="/task.css" />
+    <style>
+      #deck {
+        position: relative;
+        height: 460px;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        gap: var(--space-3);
+        padding: var(--space-5);
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+      }
+      #deck h2 {
+        font-size: 30px;
+        margin: 0;
+      }
+      #deck .body {
+        font-size: 17px;
+        color: var(--text-muted);
+        max-width: 60ch;
+      }
+      /* The code sits in the corner in small mono text — legible natively,
+       * and the natural case for zooming rather than squinting at a
+       * full-desktop capture. */
+      .code-badge {
+        position: absolute;
+        right: var(--space-4);
+        bottom: var(--space-4);
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        font-size: 13px;
+        letter-spacing: 0.08em;
+        color: var(--text-muted);
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 4px 8px;
+      }
+      .slide-no {
+        position: absolute;
+        left: var(--space-4);
+        bottom: var(--space-4);
+        font-size: 13px;
+        color: var(--text-muted);
+      }
+      .controls {
+        display: flex;
+        gap: var(--space-2);
+        align-items: center;
+        margin-top: var(--space-3);
+      }
+      .answer-row {
+        display: flex;
+        gap: var(--space-2);
+        align-items: flex-start;
+      }
+      .answer-row input {
+        flex: 1;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="task-bar">
+      <div>
+        <h1>Task 4 — Collect the slide codes</h1>
+        <p class="goal">
+          Read the codes on slides 3, 5 and 7, then enter them in that order, comma separated.
+        </p>
+      </div>
+      <div class="status" id="status">Slide 1 / 8</div>
+    </header>
+
+    <main>
+      <div id="deck">
+        <h2 id="slide-title"></h2>
+        <div class="body" id="slide-body"></div>
+        <span class="slide-no" id="slide-no"></span>
+        <span class="code-badge" id="slide-code"></span>
+      </div>
+
+      <div class="controls">
+        <button id="prev" class="secondary">◀ Previous</button>
+        <button id="next">Next ▶</button>
+        <span class="muted">Arrow keys work too.</span>
+      </div>
+
+      <div class="card" style="margin-top: var(--space-4)">
+        <h2>Your answer</h2>
+        <p class="muted">
+          Codes from slides 3, 5 and 7, in that order — for example
+          <code>ABC, DEF, GHI</code>.
+        </p>
+        <div class="answer-row">
+          <input type="text" id="answer" placeholder="e.g. K7Q, M2R, T9L" autocomplete="off" />
+          <button id="submit">Submit</button>
+        </div>
+      </div>
+
+      <div class="done-banner"></div>
+      <p class="muted" id="tally"></p>
+    </main>
+
+    <script type="module">
+      import { rng, seedFromUrl, start, complete, progress, publish } from "/task.js";
+
+      const TASK = "slides";
+      const seed = seedFromUrl(41);
+      const rand = rng(seed);
+
+      const TITLES = [
+        ["Welcome", "An eight slide deck. Each slide carries a short code in the lower right."],
+        ["Scope", "We cover throughput, latency and the cost of an unnecessary round trip."],
+        ["Throughput", "Frames arrive when the screen changes, not on a fixed clock."],
+        ["Latency", "A capture that takes longer than the eye expects breaks the sense of flow."],
+        ["Round trips", "Each observation costs a full inference, which dwarfs the capture itself."],
+        ["Batching", "Grouping actions helps only when the steps do not depend on what you see."],
+        ["Verification", "Confirming an action landed is cheaper than discovering it did not."],
+        ["Summary", "Look less, act more deliberately, and check the result."],
+      ];
+
+      // Codes avoid characters that blur into each other at small sizes (O/0,
+      // I/1), so a wrong answer means the agent misread the screen rather than
+      // that the glyphs were ambiguous.
+      const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+      const DIGITS = "23456789";
+      const codes = TITLES.map(
+        () =>
+          ALPHABET[Math.floor(rand() * ALPHABET.length)] +
+          DIGITS[Math.floor(rand() * DIGITS.length)] +
+          ALPHABET[Math.floor(rand() * ALPHABET.length)]
+      );
+
+      const WANTED = [3, 5, 7];
+      const expected = WANTED.map((n) => codes[n - 1]);
+
+      let index = 0;
+      let submitted = false;
+      const visited = new Set([1]);
+
+      const titleEl = document.getElementById("slide-title");
+      const bodyEl = document.getElementById("slide-body");
+      const codeEl = document.getElementById("slide-code");
+      const noEl = document.getElementById("slide-no");
+      const statusEl = document.getElementById("status");
+
+      function render() {
+        const [title, body] = TITLES[index];
+        titleEl.textContent = title;
+        bodyEl.textContent = body;
+        codeEl.textContent = `CODE ${codes[index]}`;
+        noEl.textContent = `Slide ${index + 1} of ${TITLES.length}`;
+        statusEl.textContent = `Slide ${index + 1} / ${TITLES.length}`;
+        visited.add(index + 1);
+        publish({
+          task: TASK,
+          seed,
+          slide: index + 1,
+          visited: [...visited].sort((a, b) => a - b),
+          submitted,
+        });
+      }
+
+      function go(delta) {
+        const next = Math.min(TITLES.length - 1, Math.max(0, index + delta));
+        if (next === index) return;
+        index = next;
+        progress(TASK, { event: "navigate", slide: index + 1 });
+        render();
+      }
+
+      document.getElementById("next").addEventListener("click", () => go(1));
+      document.getElementById("prev").addEventListener("click", () => go(-1));
+
+      document.addEventListener("keydown", (ev) => {
+        // Ignore arrows while typing the answer, or the deck would jump around
+        // under the agent mid-entry.
+        if (ev.target.tagName === "INPUT") return;
+        if (ev.key === "ArrowRight" || ev.key === "PageDown") go(1);
+        if (ev.key === "ArrowLeft" || ev.key === "PageUp") go(-1);
+      });
+
+      document.getElementById("submit").addEventListener("click", () => {
+        if (submitted) return;
+        const raw = document.getElementById("answer").value;
+        // Forgiving parse: the task is reading the codes, not punctuation.
+        const given = raw
+          .toUpperCase()
+          .split(/[,;\s]+/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const hits = expected.filter((code, i) => given[i] === code).length;
+        const score = hits / expected.length;
+        submitted = true;
+        document.getElementById("tally").textContent =
+          `${hits} of ${expected.length} codes correct. Expected ${expected.join(", ")}.`;
+        complete(TASK, {
+          success: hits === expected.length,
+          score,
+          detail: { given, expected, hits, visited: [...visited] },
+        });
+        render();
+      });
+
+      start(TASK, { seed, slides: TITLES.length, wanted: WANTED });
+      render();
+    </script>
+  </body>
+</html>

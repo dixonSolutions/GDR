@@ -1,0 +1,19 @@
+{
+  "uuid": "gdr-windows@gdr.dixonsolutions.github.io",
+  "name": "GDR Windows",
+  "description": "Exposes window enumeration, window actions and window open/close events to gdrd over the session bus (org.gdr.Windows). GNOME 50 refuses org.gnome.Shell.Introspect.GetWindows to unprivileged callers, so a shell extension is the only sanctioned way for a daemon to see the window list. Does nothing on its own \u2014 gdrd must be running and authenticated for anything to reach this.",
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48",
+    "49",
+    "50"
+  ],
+  "version": 1,
+  "url": "https://github.com/dixonSolutions/GDR",
+  "session-modes": [
+    "user",
+    "unlock-dialog"
+  ]
+}

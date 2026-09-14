@@ -11,7 +11,7 @@ rustls-pemfile = "2"
 zbus = { version = "4", default-features = false, features = ["tokio"] }
 gstreamer = "0.22"
 gstreamer-app = "0.22"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -28,6 +28,7 @@ sha2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 hex = "0.4"
 dirs = "5"
+fast_image_resize = "6.1.0"
 
 # System requirements on the target machine (install via apt):
 #   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev

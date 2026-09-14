@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Task 3 — Read the article, then answer</title>
+    <link rel="stylesheet" href="/task.css" />
+    <style>
+      article p {
+        max-width: 68ch;
+      }
+      /* Body copy at 15px is the realistic hard case: comfortably readable
+       * natively, and the first casualty of an over-aggressive downscale. */
+      article {
+        font-size: 15px;
+      }
+      .q {
+        margin-bottom: var(--space-4);
+      }
+      .q h3 {
+        margin: 0 0 var(--space-2);
+        font-size: 16px;
+      }
+      .hidden {
+        display: none;
+      }
+      .score-line {
+        font-size: 18px;
+        font-weight: 700;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="task-bar">
+      <div>
+        <h1>Task 3 — Read the article, then answer</h1>
+        <p class="goal">Read the piece, open the quiz, and answer all five questions.</p>
+      </div>
+      <div class="status" id="status">Reading</div>
+    </header>
+
+    <main>
+      <section id="article-view">
+        <div class="card">
+          <article>
+            <h2>The ochre line: how Vellmar lost its trams</h2>
+            <p class="muted">City archive feature · 6 minute read</p>
+
+            <p>
+              The Vellmar Tramway opened on 14 March <strong>1908</strong>, three years after the
+              city council rejected a proposal for an underground railway on the grounds that the
+              river silt would make tunnelling ruinous. The surface network that replaced the plan
+              was cheaper, slower, and — as it turned out — far more durable in the public memory.
+            </p>
+
+            <p>
+              Its chief engineer was <strong>Anselm Brecht</strong>, a Bremen-trained bridge
+              designer who had never built a railway of any kind. Brecht's inexperience produced
+              the network's most distinctive feature: rather than radiating from a central
+              terminus, the Vellmar lines formed a rough figure-eight, crossing themselves twice at
+              the Salt Market. Later engineers called the layout inefficient. Passengers called it
+              convenient, because it meant almost every district connected to almost every other
+              without a change.
+            </p>
+
+            <p>
+              The network grew steadily through the 1920s. At its peak in 1931 it operated
+              <strong>47 stations</strong> across six routes, carrying roughly 90,000 passengers a
+              day in a city of 210,000 people. Each route was assigned a colour, painted on the
+              car's front panel so that passengers who could not read timetables could still find
+              their line. The busiest of these, running from the shipyards to the university, was
+              the <strong>ochre</strong> route — a colour chosen, according to Brecht's notes,
+              simply because the paint was cheap and did not fade in salt air.
+            </p>
+
+            <p>
+              Decline came slowly and then all at once. Buses took the outer routes in the 1950s.
+              The council debated closure four times without deciding. What settled the argument
+              was the <strong>flood of 1962</strong>, which put the Salt Market crossing under two
+              metres of water and destroyed the signalling huts at the centre of the figure-eight.
+              Repair was costed at more than the network had earned in the previous decade. The
+              last car ran that November.
+            </p>
+
+            <p>
+              Almost nothing survives. The rails were lifted for scrap within two years, and the
+              depot became a supermarket car park. One ochre car was kept, and now sits in the
+              transport museum at Halden, repainted — to the irritation of local historians — in a
+              green livery the Vellmar Tramway never used.
+            </p>
+          </article>
+        </div>
+        <button id="to-quiz">Take the quiz</button>
+      </section>
+
+      <section id="quiz-view" class="hidden">
+        <div class="card">
+          <h2>Five questions</h2>
+          <div id="questions"></div>
+          <button id="submit">Submit answers</button>
+          <button id="back" class="secondary">Back to article</button>
+        </div>
+      </section>
+
+      <div class="done-banner"></div>
+      <p class="muted" id="tally"></p>
+    </main>
+
+    <script type="module">
+      import { start, complete, progress, publish } from "/task.js";
+
+      const TASK = "quiz";
+
+      // Every answer is stated in the article and none is guessable from world
+      // knowledge, because the city is invented. That is what makes this a
+      // reading test rather than a trivia test.
+      const QUESTIONS = [
+        {
+          q: "In which year did the Vellmar Tramway open?",
+          options: ["1898", "1908", "1921", "1931"],
+          answer: 1,
+        },
+        {
+          q: "Who was the network's chief engineer?",
+          options: ["Mira Delacroix", "Anselm Brecht", "Otto Halden", "Piet Vellmar"],
+          answer: 1,
+        },
+        {
+          q: "How many stations did the network operate at its peak?",
+          options: ["38", "42", "47", "61"],
+          answer: 2,
+        },
+        {
+          q: "Which colour was the busiest route?",
+          options: ["Ochre", "Green", "Crimson", "Slate"],
+          answer: 0,
+        },
+        {
+          q: "What finally forced the closure?",
+          options: [
+            "A council vote in 1955",
+            "Competition from the underground railway",
+            "A fire at the depot",
+            "The flood of 1962",
+          ],
+          answer: 3,
+        },
+      ];
+
+      const questionsEl = document.getElementById("questions");
+      questionsEl.innerHTML = QUESTIONS.map(
+        (item, qi) => `
+          <div class="q">
+            <h3>${qi + 1}. ${item.q}</h3>
+            ${item.options
+              .map(
+                (opt, oi) =>
+                  `<label class="choice"><input type="radio" name="q${qi}" value="${oi}" /><span>${opt}</span></label>`
+              )
+              .join("")}
+          </div>`
+      ).join("");
+
+      const articleView = document.getElementById("article-view");
+      const quizView = document.getElementById("quiz-view");
+      const statusEl = document.getElementById("status");
+      let submitted = false;
+
+      function setView(showQuiz) {
+        articleView.classList.toggle("hidden", showQuiz);
+        quizView.classList.toggle("hidden", !showQuiz);
+        statusEl.textContent = showQuiz ? "Quiz" : "Reading";
+        window.scrollTo(0, 0);
+        publish({ task: TASK, view: showQuiz ? "quiz" : "article", submitted });
+        progress(TASK, { event: showQuiz ? "open_quiz" : "back_to_article" });
+      }
+
+      document.getElementById("to-quiz").addEventListener("click", () => setView(true));
+      document.getElementById("back").addEventListener("click", () => setView(false));
+
+      document.getElementById("submit").addEventListener("click", () => {
+        if (submitted) return;
+        const picked = QUESTIONS.map((_, qi) => {
+          const el = document.querySelector(`input[name="q${qi}"]:checked`);
+          return el ? Number(el.value) : null;
+        });
+        const answered = picked.filter((p) => p !== null).length;
+        if (answered < QUESTIONS.length) {
+          document.getElementById("tally").textContent =
+            `Answer all five before submitting — ${answered} of ${QUESTIONS.length} selected.`;
+          progress(TASK, { event: "incomplete_submit", answered });
+          return;
+        }
+
+        submitted = true;
+        const correct = picked.filter((p, i) => p === QUESTIONS[i].answer).length;
+        const score = correct / QUESTIONS.length;
+        document.getElementById("tally").innerHTML =
+          `<span class="score-line">${correct} of ${QUESTIONS.length} correct</span>`;
+        complete(TASK, {
+          success: correct >= 4,
+          score,
+          detail: { correct, total: QUESTIONS.length, picked },
+        });
+        publish({ task: TASK, view: "quiz", submitted: true, correct });
+      });
+
+      start(TASK, { questions: QUESTIONS.length });
+      publish({ task: TASK, view: "article", submitted: false });
+    </script>
+  </body>
+</html>

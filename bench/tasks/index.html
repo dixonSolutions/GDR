@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>GDR computer-use benchmark</title>
+    <link rel="stylesheet" href="/task.css" />
+    <style>
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+        gap: var(--space-3);
+      }
+      a.task-link {
+        display: block;
+        text-decoration: none;
+        color: inherit;
+      }
+      a.task-link .card {
+        margin: 0;
+        height: 100%;
+      }
+      a.task-link .card:hover {
+        border-color: var(--accent);
+      }
+      .tag {
+        display: inline-block;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--accent);
+        margin-bottom: var(--space-1);
+      }
+    </style>
+  </head>
+  <body>
+    <header class="task-bar">
+      <div>
+        <h1>GDR computer-use benchmark</h1>
+        <p class="goal">Five desktop tasks, each scored by the page rather than by the agent.</p>
+      </div>
+    </header>
+
+    <main>
+      <div class="grid">
+        <a class="task-link" href="/shapes/"
+          ><div class="card">
+            <span class="tag">Aim</span>
+            <h2>1 · Turn every shape red</h2>
+            <p class="muted">Precise clicking on targets from 26 to 80 pixels, mixed with decoys.</p>
+          </div></a
+        >
+        <a class="task-link" href="/cycle/"
+          ><div class="card">
+            <span class="tag">State</span>
+            <h2>2 · Cycle every swatch to green</h2>
+            <p class="muted">Count steps through a colour cycle without overshooting.</p>
+          </div></a
+        >
+        <a class="task-link" href="/quiz/"
+          ><div class="card">
+            <span class="tag">Reading</span>
+            <h2>3 · Read the article, then answer</h2>
+            <p class="muted">Small body text, five questions, answers only in the article.</p>
+          </div></a
+        >
+        <a class="task-link" href="/slides/"
+          ><div class="card">
+            <span class="tag">Navigation</span>
+            <h2>4 · Collect the slide codes</h2>
+            <p class="muted">Keyboard paging plus small monospace codes to transcribe.</p>
+          </div></a
+        >
+        <a class="task-link" href="/news/"
+          ><div class="card">
+            <span class="tag">Scroll &amp; write</span>
+            <h2>5 · Summarise the front page</h2>
+            <p class="muted">Scroll a long page, gather four facts, compose and submit.</p>
+          </div></a
+        >
+      </div>
+    </main>
+  </body>
+</html>

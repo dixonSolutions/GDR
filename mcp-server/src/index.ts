@@ -13,6 +13,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, GdrClientPool } from "./gdrClient.js";
 import {
+  configPath,
   devicePublicInfo,
   getPasswordMessage,
   listDevicesPayload,
@@ -22,14 +23,58 @@ import {
   upsertDevice,
 } from "./config.js";
 import { parseServerArgv, getDefaultDevice } from "./cliArgs.js";
-import { chord, hotkey, runSequence, tapKey, type InputStep } from "./input.js";
+import {
+  chord,
+  hotkey,
+  runSequence,
+  runSequenceDetailed,
+  scroll,
+  tapKey,
+  type InputStep,
+} from "./input.js";
 import { resolveKey } from "./keys.js";
 import {
-  applyScreenshotLayout,
+  frameMeta,
   FrameStateStore,
+  PROFILE_NAMES,
+  profileForLayout,
+  profileRequest,
   type LayoutMode,
+  type ProfileName,
 } from "./screenshotLayout.js";
 import { screenLockFields } from "./lockHint.js";
+import type { WindowInfo, WindowOp, WindowTarget } from "./gdrClient.js";
+import {
+  captureBlocker,
+  chooseTarget,
+  cleanTarget,
+  describeTarget,
+  isEmptyTarget,
+  resolvePin,
+  resolveWindow,
+  WINDOW_ACTIONS,
+  WindowSelectionError,
+  windowSummary,
+} from "./windows.js";
+import {
+  activitySpec,
+  hookEventSummary,
+  hookSummary,
+  pollNote,
+  windowSpec,
+  WINDOW_HOOK_EVENTS,
+} from "./hooks.js";
+import {
+  appendWindowLog,
+  clearPin,
+  deviceIdFor,
+  getPin,
+  pinToTarget,
+  readWindowLog,
+  setPin,
+  windowLogPath,
+  type PinnedWindow,
+} from "./windowPin.js";
 
 parseServerArgv();
 if (getDefaultDevice()) {
@@ -58,8 +103,17 @@ function clientFor(host?: string | null, dev?: string | null) {
 /** Remap image-space coords using the last screenshot for this device. */
 function mapPointer(host: string | undefined, dev: string | undefined, x: number, y: number) {
   const key = deviceKey(host, dev);
-  const { stream_x, stream_y, click_space } = frames.toStream(key, x, y);
-  return { key, x, y, stream_x, stream_y, click_space };
+  const { stream_x, stream_y, frame } = frames.toStream(key, x, y);
+  // Echo the space the coordinates were read in, so a mis-scaled click is
+  // visible in the transcript rather than something to reverse-engineer.
+  return {
+    key,
+    x,
+    y,
+    stream_x,
+    stream_y,
+    click_space: `${frame.image_width}x${frame.image_height}`,
+  };
 }
 
 function remapInputSteps(
@@ -83,35 +137,94 @@ function remapInputSteps(
         },
       };
     }
+    if ("scroll" in step && step.scroll.at) {
+      const { stream_x, stream_y } = frames.toStream(key, step.scroll.at.x, step.scroll.at.y);
+      return { scroll: { ...step.scroll, at: { x: stream_x, y: stream_y } } };
+    }
     return step;
   });
 }
 
-async function screenshotResult(
+interface CaptureOpts {
+  profile: ProfileName;
+  region?: { x: number; y: number; width: number; height: number };
+  /** Wait for the screen to stop repainting before grabbing the frame. */
+  settle?: boolean;
+  quiet_ms?: number;
+  timeout_ms?: number;
+  /** Skip the image when the screen is byte-identical to the last one. */
+  skipUnchanged?: boolean;
+}
+
+const DEFAULT_QUIET_MS = 120;
+/**
+ * Bounded by the Doherty threshold: a capture that blows past ~400 ms stops
+ * feeling interactive, and waiting longer does not help the case that actually
+ * costs us. Damage is stream-wide, so one blinking terminal cursor anywhere on
+ * the desktop keeps the whole screen "busy" forever — measured on a working
+ * developer desktop, the frame changed in 11 of 11 samples taken 200 ms apart.
+ * Such a screen can never go quiet, so the wait is a pure tax that ends in
+ * `settled: false` regardless of how patient we are.
+ */
+const DEFAULT_SETTLE_TIMEOUT_MS = 400;
+
+/**
+ * Capture, store geometry for click remapping, and return an MCP result.
+ *
+ * gdrd sizes and encodes the image, so nothing is decoded here — the
+ * screenshot arrives ready to hand to the model.
+ */
+async function captureResult(
   host: string | undefined,
   dev: string | undefined,
-  layout: LayoutMode
+  opts: CaptureOpts
 ) {
   const key = deviceKey(host, dev);
   const client = clientFor(host, dev);
-  const resp = await client.request({ type: "Screenshot", connector: null });
-  if (resp.type !== "Screenshot") return textResult(resp, true);
-  const applied = await applyScreenshotLayout(resp.png_base64, layout);
-  frames.set(key, {
-    native_width: applied.meta.native_width,
-    native_height: applied.meta.native_height,
-    image_width: applied.meta.image_width,
-    image_height: applied.meta.image_height,
-    layout: applied.meta.layout,
-    click_space: applied.meta.click_space,
+  const raw = opts.profile === "raw";
+  const frame = await client.captureFrame({
+    ...profileRequest(opts.profile),
+    region: opts.region ?? null,
+    format: raw ? "png" : "jpeg",
+    settle: opts.settle
+      ? {
+          quiet_ms: opts.quiet_ms ?? DEFAULT_QUIET_MS,
+          timeout_ms: opts.timeout_ms ?? DEFAULT_SETTLE_TIMEOUT_MS,
+        }
+      : null,
+    if_none_match: opts.skipUnchanged ? (frames.lastHash(key) ?? null) : null,
   });
+
+  const meta = frameMeta(frame, opts.profile);
+  frames.set(key, {
+    native_width: meta.native_width,
+    native_height: meta.native_height,
+    image_width: meta.image_width,
+    image_height: meta.image_height,
+    region: meta.region,
+  });
+  frames.setHash(key, frame.hash);
+
+  // Identical screen: report it instead of re-sending the same pixels. The
+  // agent learns its action had no visible effect, and the message prefix
+  // stays byte-identical so prompt caching keeps hitting.
+  if (frame.unchanged) {
+    return textResult({
+      ...meta,
+      unchanged: true,
+      note:
+        "Screen is identical to the previous screenshot for this device — the last " +
+        "action had no visible effect. Coordinates from that screenshot are still valid.",
+    });
+  }
+
   return {
     content: [
-      { type: "text" as const, text: JSON.stringify(applied.meta) },
+      { type: "text" as const, text: JSON.stringify(meta) },
       {
         type: "image" as const,
-        data: applied.png_base64,
-        mimeType: "image/png" as const,
+        data: frame.data_base64,
+        mimeType: frame.format === "jpeg" ? ("image/jpeg" as const) : ("image/png" as const),
       },
     ],
   };
@@ -139,8 +252,60 @@ const layoutProp = z
   .enum(["raw", "agent"])
   .default("agent")
   .describe(
-    'Screenshot post-process: "agent" (default) downscales to fit 1440×900 and ' +
-      'returns geometry text; clicks use image pixel space. "raw" keeps native PNG 1:1.'
+    'Coarse sizing: "agent" (default) sizes for the model and returns geometry ' +
+      'text; clicks use image pixel space. "raw" keeps native PNG 1:1. ' +
+      "Superseded by `profile` — set that instead when you care."
+  );
+
+const profileProp = z
+  .enum(PROFILE_NAMES)
+  .optional()
+  .describe(
+    "Sizing target. claude (default) fits the ≤1568 visual-token budget; " +
+      "claude-hires uses the ≤4784 tier; openai fits 1440×900; raw is native 1:1. " +
+      "Sizing over a model's token budget makes its API silently downscale again, " +
+      "which offsets every click — leave this alone unless you know the target."
+  );
+
+/**
+ * Off by default for a plain look at the screen.
+ *
+ * Settling is only worth paying for when a capture races a transition the
+ * caller just started — which is what `gdr_act` handles. On its own,
+ * `gdr_screenshot` returns the newest frame either way, so waiting buys at
+ * most one frame of freshness (~16 ms) while costing the whole settle budget
+ * on any desktop with a blinking cursor. Measured: 9 ms without, ~650 ms with.
+ */
+const settleProp = z
+  .boolean()
+  .default(false)
+  .describe(
+    "Wait for the desktop to stop repainting before capturing (default false). " +
+      "Off is the right choice for simply looking at the screen: the newest " +
+      "frame is returned regardless. Turn it on when capturing right after an " +
+      "action you performed yourself, to avoid catching a half-drawn UI — " +
+      "though gdr_act already does this for you."
+  );
+
+/**
+ * On by default, because here the capture deliberately follows an action and
+ * would otherwise be prone to catching a half-drawn window.
+ */
+const settleAfterActionProp = z
+  .boolean()
+  .default(true)
+  .describe(
+    "Wait for the UI to stop repainting after the steps before capturing " +
+      "(default true). Uses compositor damage events rather than a fixed sleep."
+  );
+
+const skipUnchangedProp = z
+  .boolean()
+  .default(false)
+  .describe(
+    "When the screen is identical to the previous capture for this device, " +
+      "return a short 'unchanged' note instead of the image. Cheap way to check " +
+      "whether an action had any visible effect."
   );
 
 const hostProp = z
@@ -183,6 +348,18 @@ const inputStep = z.union([
   z.object({ type: z.string() }).describe("Type ASCII text"),
   z.object({ delay_ms: z.number().nonnegative() }).describe("Wait before next step"),
   z.object({ move: z.object({ x: z.number(), y: z.number() }) }),
+  z
+    .object({
+      scroll: z.object({
+        dx: z.number().optional(),
+        dy: z.number().optional().describe("Positive scrolls down, negative up"),
+        at: z
+          .object({ x: z.number(), y: z.number() })
+          .optional()
+          .describe("Point at this first, in screenshot image space"),
+      }),
+    })
+    .describe("Wheel scroll, optionally after pointing somewhere"),
   z.object({
     click: z.object({
       x: z.number(),
@@ -195,20 +372,109 @@ const inputStep = z.union([
 
 const server = new McpServer({ name: "gdr", version: "0.3.0" });
 
-server.tool(
-  "gdr_screenshot",
-  "Take a screenshot of the remote GNOME/Wayland desktop. Returns geometry JSON " +
-    "(native/image size, click_space) then a PNG. Default layout=agent fits the " +
-    "image inside 1440×900; pass x,y to gdr_click/gdr_move in that image pixel space.",
-  { ...deviceArgs, layout: layoutProp },
-  async ({ host, dev, layout }) => screenshotResult(host, dev, layout)
-);
+const screenshotArgs = {
+  ...deviceArgs,
+  layout: layoutProp,
+  profile: profileProp,
+  settle: settleProp,
+  skip_unchanged: skipUnchangedProp,
+};
+
+type ScreenshotArgs = {
+  host?: string;
+  dev?: string;
+  layout: LayoutMode;
+  profile?: ProfileName;
+  settle: boolean;
+  skip_unchanged: boolean;
+};
+
+async function screenshotTool(a: ScreenshotArgs) {
+  try {
+    return await captureResult(a.host, a.dev, {
+      profile: profileForLayout(a.layout, a.profile),
+      settle: a.settle,
+      skipUnchanged: a.skip_unchanged,
+    });
+  } catch (e) {
+    return mapError(e);
+  }
+}
 
 server.tool(
-  "gnome_screenshot",
-  "Alias for gdr_screenshot.",
-  { ...deviceArgs, layout: layoutProp },
-  async ({ host, dev, layout }) => screenshotResult(host, dev, layout)
+  "gdr_screenshot",
+  "Screenshot the remote GNOME/Wayland desktop. Returns geometry JSON " +
+    "(native/image size, visual_tokens, region) then the image. Pass x,y to " +
+    "gdr_click/gdr_move in that image's pixel space. Waits for the screen to " +
+    "stop repainting by default, so you rarely need a delay before capturing. " +
+    "For anything smaller than ~20px, use gdr_zoom instead of guessing.",
+  screenshotArgs,
+  screenshotTool
+);
+
+server.tool("gnome_screenshot", "Alias for gdr_screenshot.", screenshotArgs, screenshotTool);
+
+server.tool(
+  "gdr_zoom",
+  "Screenshot a rectangle of the desktop at full native resolution. Use this " +
+    "for small targets — tray icons, checkboxes, dropdown arrows, tight menu " +
+    "rows — where a full screenshot does not have the pixels to aim reliably. " +
+    "By default x,y,width,height are in the pixel space of the last full " +
+    'gdr_screenshot. Pass space="stream" to give them in capture-stream ' +
+    "pixels instead — that is the space gdr_hook_events reports activity " +
+    "circles in, and it needs no prior screenshot, so a hook can send you " +
+    "straight here. Afterwards, gdr_click coordinates are read off the ZOOM " +
+    "image; take a full gdr_screenshot again before clicking outside it.",
+  {
+    ...deviceArgs,
+    x: z.number().describe("Left edge"),
+    y: z.number().describe("Top edge"),
+    width: z.number().positive().describe("Region width"),
+    height: z.number().positive().describe("Region height"),
+    space: z
+      .enum(["image", "stream"])
+      .default("image")
+      .describe(
+        'Coordinate space of x/y/width/height. "image" (default) is the last ' +
+          'gdr_screenshot\'s pixels and requires one to have been taken. "stream" is ' +
+          "native capture pixels — what gdr_hook_events, Region and gdr_windows' " +
+          "stream_region use — and needs no prior screenshot."
+      ),
+    settle: settleProp,
+  },
+  async ({ host, dev, x, y, width, height, space, settle }) => {
+    try {
+      // Stream coordinates are already the space gdrd crops in, so they go
+      // through untouched. This is what makes "a hook told me where to look"
+      // a complete workflow: remapping from image space needs a screenshot,
+      // and the whole point of the hook is not having taken one.
+      const region =
+        space === "stream"
+          ? {
+              x: Math.round(x),
+              y: Math.round(y),
+              width: Math.max(1, Math.round(width)),
+              height: Math.max(1, Math.round(height)),
+            }
+          : (() => {
+              const key = deviceKey(host, dev);
+              // Convert both corners through the same remap the clicks use,
+              // so a zoom taken from a downscaled screenshot lands on the
+              // pixels the agent pointed at.
+              const topLeft = frames.toStream(key, x, y);
+              const bottomRight = frames.toStream(key, x + width, y + height);
+              return {
+                x: Math.round(topLeft.stream_x),
+                y: Math.round(topLeft.stream_y),
+                width: Math.max(1, Math.round(bottomRight.stream_x - topLeft.stream_x)),
+                height: Math.max(1, Math.round(bottomRight.stream_y - topLeft.stream_y)),
+              };
+            })();
+      return await captureResult(host, dev, { profile: "raw", settle, region });
+    } catch (e) {
+      return mapError(e);
+    }
+  }
 );
 
 server.tool(
@@ -351,6 +617,36 @@ server.tool(
 );
 
 server.tool(
+  "gdr_scroll",
+  "Scroll the wheel. Positive dy scrolls down, negative up; one notch is " +
+    "about 1.0. Pass x,y to point at the pane you mean first — the compositor " +
+    "sends wheel events to whatever is under the pointer, so without it you " +
+    "may scroll a different window. Coordinates use the latest screenshot " +
+    "image pixel space (same as gdr_click).",
+  {
+    ...deviceArgs,
+    dy: z.number().default(3).describe("Vertical notches; positive is down"),
+    dx: z.number().default(0).describe("Horizontal notches; positive is right"),
+    x: z.number().optional().describe("Point here first (image space)"),
+    y: z.number().optional().describe("Point here first (image space)"),
+  },
+  async ({ host, dev, dx, dy, x, y }) => {
+    try {
+      const client = clientFor(host, dev);
+      let at: { x: number; y: number } | undefined;
+      if (x !== undefined && y !== undefined) {
+        const mapped = mapPointer(host, dev, x, y);
+        at = { x: mapped.stream_x, y: mapped.stream_y };
+      }
+      const resp = await scroll(client, { dx, dy, at });
+      return textResult({ ...resp, dx, dy, pointed_at: at ?? null });
+    } catch (e) {
+      return mapError(e);
+    }
+  }
+);
+
+server.tool(
   "gnome_move",
   "Alias for gdr_move.",
   { ...deviceArgs, x: z.number(), y: z.number() },
@@ -478,6 +774,94 @@ server.tool(
     try {
       const result = await runSequence(client, remapInputSteps(host, dev, steps));
       return textResult(result);
+    } catch (e) {
+      return mapError(e);
+    }
+  }
+);
+
+/**
+ * Cheap "did anything change?" probe.
+ *
+ * Captures at a deliberately tiny size so the encode is negligible; we only
+ * ever look at the hash. Both probes must use identical parameters, since
+ * the hash is salted with them.
+ */
+const PROBE = { max_width: 320, max_height: 320, format: "jpeg" as const, quality: 60 };
+
+server.tool(
+  "gdr_act",
+  "Run a sequence of actions and return the resulting screenshot in ONE call. " +
+    "This is the preferred way to drive the desktop: it replaces the " +
+    "act → screenshot → act → screenshot round trips that dominate task time. " +
+    "Steps use the same shapes as gdr_input (tap/down/up/chord/hotkey/type/" +
+    "delay_ms/move/click); move and click x,y are in the latest screenshot image " +
+    "space. Waits for the UI to settle, then captures. " +
+    "Stops at the first failing step and still returns a screenshot of the real " +
+    "state, so you can see exactly where things diverged. " +
+    "Best for self-contained sequences (form fills, keyboard chains, clicking a " +
+    "known target). For exploratory navigation, observe between steps instead.",
+  {
+    ...deviceArgs,
+    steps: z.array(inputStep).min(1).describe("Ordered actions to run before capturing"),
+    expect_change: z
+      .boolean()
+      .default(false)
+      .describe(
+        "Verify the sequence actually changed the screen, and report an error " +
+          "if it did not. Turns a silently missed click into a reported failure."
+      ),
+    profile: profileProp,
+    settle: settleAfterActionProp,
+    screenshot: z
+      .boolean()
+      .default(true)
+      .describe("Capture after the steps (default true). Set false for fire-and-forget."),
+  },
+  async ({ host, dev, steps, expect_change, profile, settle, screenshot }) => {
+    try {
+      const client = clientFor(host, dev);
+      const before = expect_change ? (await client.captureFrame(PROBE)).hash : null;
+
+      const outcome = await runSequenceDetailed(client, remapInputSteps(host, dev, steps));
+
+      let changed: boolean | undefined;
+      if (expect_change && before !== null) {
+        const after = await client.captureFrame({
+          ...PROBE,
+          settle: { quiet_ms: DEFAULT_QUIET_MS, timeout_ms: DEFAULT_SETTLE_TIMEOUT_MS },
+          if_none_match: before,
+        });
+        changed = !after.unchanged;
+      }
+
+      const failed = !outcome.ok || changed === false;
+      const summary = {
+        ...outcome,
+        ...(changed === undefined ? {} : { changed }),
+        ...(changed === false
+          ? {
+              error:
+                outcome.error ??
+                "all steps ran but the screen did not change — the action probably missed its target",
+            }
+          : {}),
+      };
+
+      if (!screenshot) return textResult(summary, failed);
+
+      // Always show real state, especially on failure: "step 3 of 7 failed"
+      // plus a picture of what actually happened is recoverable; a bare
+      // error leaves the agent guessing which half of its plan landed.
+      const shot = await captureResult(host, dev, {
+        profile: profileForLayout(undefined, profile),
+        settle,
+      });
+      return {
+        ...shot,
+        content: [{ type: "text" as const, text: JSON.stringify(summary) }, ...shot.content],
+        isError: failed,
+      };
     } catch (e) {
       return mapError(e);
     }
@@ -680,6 +1064,1186 @@ server.tool(
       });
     } catch (e) {
       return textResult({ ok: false, error: String(e) }, true);
+    }
+  }
+);
+
+
+// --------------------------------------------------------------------------
+// Window plane
+//
+// Everything below needs the gdr-windows GNOME Shell extension on the target
+// (GNOME 50 refuses org.gnome.Shell.Introspect to unprivileged callers). gdrd
+// returns a one-line install hint when it is missing, and these tools pass it
+// through verbatim rather than inventing their own wording.
+// --------------------------------------------------------------------------
+
+const windowSelectorArgs = {
+  id: z
+    .number()
+    .int()
+    .optional()
+    .describe("Exact window id from gdr_windows. Fastest and unambiguous, but ids die with the window."),
+  app_id: z
+    .string()
+    .optional()
+    .describe('Desktop-file id, e.g. "org.gnome.Nautilus" (the .desktop suffix is optional). Exact, case-insensitive.'),
+  wm_class: z.string().optional().describe("WM_CLASS substring, case-insensitive."),
+  title: z.string().optional().describe("Window title substring, case-insensitive."),
+  pid: z.number().int().optional().describe("Process id owning the window."),
+  focused: z.boolean().optional().describe("Match whatever currently has keyboard focus."),
+};
+
+type SelectorArgs = {
+  id?: number;
+  app_id?: string;
+  wm_class?: string;
+  title?: string;
+  pid?: number;
+  focused?: boolean;
+};
+
+function targetFromArgs(a: SelectorArgs): WindowTarget {
+  return cleanTarget({
+    id: a.id,
+    app_id: a.app_id,
+    wm_class: a.wm_class,
+    title: a.title,
+    pid: a.pid,
+    focused: a.focused,
+  });
+}
+
+/**
+ * Find the window a call means: explicit selector, else the pin, else focus.
+ *
+ * Returns the live window plus the full list, because callers almost always
+ * need both — the list to report candidates on failure, the window to act on.
+ * The pin is resolved through {@link resolvePin} so it survives the app
+ * restarting, and a pin whose id went stale is quietly rewritten here rather
+ * than making the user re-pin.
+ */
+async function pickWindow(
+  host: string | undefined,
+  dev: string | undefined,
+  selector: SelectorArgs,
+  opts: { allowFocusedFallback?: boolean } = {}
+): Promise<{
+  window: WindowInfo;
+  windows: WindowInfo[];
+  list: Awaited<ReturnType<GdrClientType["listWindows"]>>;
+  source: "explicit" | "pin" | "focused";
+  deviceId: string | null;
+}> {
+  const client = clientFor(host, dev);
+  const list = await client.listWindows(true);
+
+  let deviceId: string | null = null;
+  let pin: PinnedWindow | null = null;
+  try {
+    deviceId = deviceIdFor(dev || host);
+    pin = getPin(deviceId);
+  } catch {
+    // Env-configured device with no config entry: no pin, still usable.
+  }
+
+  const explicit = targetFromArgs(selector);
+  if (!isEmptyTarget(explicit)) {
+    return {
+      window: resolveWindow(explicit, list.windows),
+      windows: list.windows,
+      list,
+      source: "explicit",
+      deviceId,
+    };
+  }
+  if (pin) {
+    const resolved = resolvePin(pinToTarget(pin) as WindowTarget, list.windows);
+    if (resolved.stale_id && deviceId) {
+      // Self-healing: the app restarted, the durable selector still found it,
+      // so refresh the recorded id instead of leaving a pin that takes the
+      // slow path (and misleading output) forever after.
+      setPin(deviceId, { ...pin, id: resolved.window.id, pinned_at: pin.pinned_at });
+    }
+    return {
+      window: resolved.window,
+      windows: list.windows,
+      list,
+      source: "pin",
+      deviceId,
+    };
+  }
+  const chosen = chooseTarget(null, null, opts.allowFocusedFallback ?? true);
+  return {
+    window: resolveWindow(chosen.target, list.windows),
+    windows: list.windows,
+    list,
+    source: "focused",
+    deviceId,
+  };
+}
+
+type GdrClientType = ReturnType<typeof clientFor>;
+
+/** Turn a selection failure into a result the agent can act on. */
+function windowError(e: unknown, windows?: WindowInfo[]) {
+  if (e instanceof WindowSelectionError) {
+    return textResult(
+      {
+        error: e.message,
+        candidates: (e.candidates.length ? e.candidates : (windows ?? [])).map(
+          windowSummary
+        ),
+      },
+      true
+    );
+  }
+  return mapError(e);
+}
+
+/**
+ * Put a window on screen so a capture can actually see it.
+ *
+ * Wayland gives gdrd the composited screen, not a per-window buffer, so a
+ * minimized or buried window simply is not in the pixels. Activating is
+ * therefore part of "view this window", not an optional extra — but it is
+ * still visible to the user, so the result always says whether it happened.
+ */
+async function ensureOnScreen(
+  client: GdrClientType,
+  window: WindowInfo,
+  activate: boolean
+): Promise<{ window: WindowInfo; activated: boolean; blocker: string | null }> {
+  const blocker = captureBlocker(window);
+  if (!blocker) return { window, activated: false, blocker: null };
+  if (!activate) return { window, activated: false, blocker };
+
+  await client.windowAction({ id: window.id }, { action: "activate" });
+  // Re-list rather than trusting the action's echo: activating can switch
+  // workspace and move the window between monitors, and only a fresh listing
+  // carries a stream_region computed against the live capture.
+  const after = await client.listWindows(true);
+  const fresh = after.windows.find((w) => w.id === window.id);
+  if (!fresh) {
+    return { window, activated: true, blocker: "window disappeared while activating" };
+  }
+  return { window: fresh, activated: true, blocker: captureBlocker(fresh) };
+}
+
+server.tool(
+  "gdr_windows",
+  "List every window on the remote desktop: id, app, title, geometry, workspace, " +
+    "and whether it can be screenshotted right now. Start here — the ids and " +
+    "app_ids feed every other gdr_window_* tool. Also reports which monitor gdrd " +
+    "is capturing, since windows elsewhere cannot be captured without moving them.",
+  {
+    ...deviceArgs,
+    filter: z
+      .string()
+      .optional()
+      .describe("Case-insensitive substring; matches app_id, wm_class or title."),
+    include_skip_taskbar: z
+      .boolean()
+      .default(false)
+      .describe("Include panels, docks and notification popups (normally noise)."),
+    log: z
+      .boolean()
+      .default(false)
+      .describe("Append this snapshot to the local window log (see gdr_window_log)."),
+  },
+  async ({ host, dev, filter, include_skip_taskbar, log }) => {
+    try {
+      const client = clientFor(host, dev);
+      const list = await client.listWindows(include_skip_taskbar);
+      const needle = filter?.trim().toLowerCase();
+      const windows = needle
+        ? list.windows.filter((w) =>
+            [w.app_id, w.wm_class, w.title].some((v) =>
+              (v ?? "").toLowerCase().includes(needle)
+            )
+          )
+        : list.windows;
+
+      let deviceId: string | null = null;
+      let pinned: PinnedWindow | null = null;
+      try {
+        deviceId = deviceIdFor(dev || host);
+        pinned = getPin(deviceId);
+      } catch {
+        /* env device: no pin store */
+      }
+
+      if (log) {
+        appendWindowLog(
+          windows.map((w) => ({
+            ts: new Date().toISOString(),
+            device: deviceId,
+            kind: "window_event" as const,
+            event: "snapshot",
+            window: windowSummary(w),
+          }))
+        );
+      }
+
+      return textResult({
+        backend: list.backend,
+        capture_connector: list.capture_connector,
+        active_workspace: list.active_workspace,
+        n_workspaces: list.n_workspaces,
+        focus_window: list.focus_window,
+        seq: list.seq,
+        pinned_window: pinned,
+        monitors: list.monitors,
+        count: windows.length,
+        windows: windows.map(windowSummary),
+        note:
+          "Pass id= (exact) or app_id/title (durable) to the other gdr_window_* tools, " +
+          "or pin one with gdr_window_pin to stop repeating the selector. " +
+          "`seq` is the starting point for gdr_window_events.",
+      });
+    } catch (e) {
+      return mapError(e);
+    }
+  }
+);
+
+server.tool(
+  "gdr_window_info",
+  "Resolve one window and report its full state — including which window the " +
+    "pin currently points at when no selector is given. Use it to check a pin " +
+    "still resolves, or to get a window's geometry before moving it.",
+  { ...deviceArgs, ...windowSelectorArgs },
+  async ({ host, dev, ...selector }) => {
+    try {
+      const picked = await pickWindow(host, dev, selector);
+      return textResult({
+        source: picked.source,
+        window: windowSummary(picked.window),
+        raw: picked.window,
+        capture_blocker: captureBlocker(picked.window),
+        capture_connector: picked.list.capture_connector,
+      });
+    } catch (e) {
+      return windowError(e);
+    }
+  }
+);
+
+server.tool(
+  "gdr_window_control",
+  "Act on a specific window: activate (raise it, unminimize it, switch to its " +
+    "workspace), minimize, maximize, move, resize, send to another workspace, or " +
+    "close it. With no selector this acts on the pinned window. " +
+    "`activate` is the one that makes a window that is not currently on screen " +
+    "visible to gdr_screenshot — Wayland streams the composited desktop, so a " +
+    "buried window is genuinely not in the pixels.",
+  {
+    ...deviceArgs,
+    ...windowSelectorArgs,
+    action: z.enum(WINDOW_ACTIONS).describe("What to do to the window."),
+    x: z.number().int().optional().describe("move/move_resize: left edge, logical pixels."),
+    y: z.number().int().optional().describe("move/move_resize: top edge, logical pixels."),
+    width: z.number().int().optional().describe("resize/move_resize: width, logical pixels."),
+    height: z.number().int().optional().describe("resize/move_resize: height, logical pixels."),
+    index: z.number().int().optional().describe("workspace: target workspace index (0-based)."),
+  },
+  async ({ host, dev, action, x, y, width, height, index, ...selector }) => {
+    let windows: WindowInfo[] | undefined;
+    try {
+      const picked = await pickWindow(host, dev, selector);
+      windows = picked.windows;
+
+      let op: WindowOp;
+      switch (action) {
+        case "move":
+          if (x == null || y == null) throw new Error("move needs x and y");
+          op = { action, x, y };
+          break;
+        case "resize":
+          if (width == null || height == null) {
+            throw new Error("resize needs width and height");
+          }
+          op = { action, width, height };
+          break;
+        case "move_resize":
+          if (x == null || y == null || width == null || height == null) {
+            throw new Error("move_resize needs x, y, width and height");
+          }
+          op = { action, x, y, width, height };
+          break;
+        case "workspace":
+          if (index == null) throw new Error("workspace needs index");
+          op = { action, index };
+          break;
+        default:
+          op = { action } as WindowOp;
+      }
+
+      const client = clientFor(host, dev);
+      const result = await client.windowAction({ id: picked.window.id }, op);
+      appendWindowLog([
+        {
+          ts: new Date().toISOString(),
+          device: picked.deviceId,
+          kind: "window_action",
+          action,
+          selector: describeTarget(targetFromArgs(selector)),
+          source: picked.source,
+          window: windowSummary(picked.window),
+        },
+      ]);
+      return textResult({
+        ok: true,
+        action: result.action,
+        source: picked.source,
+        window: result.window ? windowSummary(result.window) : null,
+        was: windowSummary(picked.window),
+        note:
+          action === "activate"
+            ? "The window is now on screen; gdr_screenshot or gdr_window_screenshot will show it."
+            : undefined,
+      });
+    } catch (e) {
+      return windowError(e, windows);
+    }
+  }
+);
+
+server.tool(
+  "gdr_window_screenshot",
+  "Screenshot ONE window instead of the whole desktop — fewer visual tokens and " +
+    "no surrounding clutter. Activates the window first by default, because a " +
+    "minimized or buried window is not present in the compositor's stream at all. " +
+    "Afterwards gdr_click / gdr_act coordinates are read off THIS image; take a " +
+    "full gdr_screenshot before clicking anything outside the window.",
+  {
+    ...deviceArgs,
+    ...windowSelectorArgs,
+    activate: z
+      .boolean()
+      .default(true)
+      .describe(
+        "Raise and unminimize the window first (default true). Set false to " +
+          "capture without disturbing what the user is doing — but a window " +
+          "that is not on screen then cannot be captured at all."
+      ),
+    profile: profileProp,
+    settle: settleProp,
+  },
+  async ({ host, dev, activate, profile, settle, ...selector }) => {
+    let windows: WindowInfo[] | undefined;
+    try {
+      const picked = await pickWindow(host, dev, selector);
+      windows = picked.windows;
+      const client = clientFor(host, dev);
+      const ready = await ensureOnScreen(client, picked.window, activate);
+
+      if (ready.blocker || !ready.window.stream_region) {
+        return textResult(
+          {
+            error: `cannot capture this window: ${ready.blocker ?? "no capture geometry"}`,
+            window: windowSummary(ready.window),
+            hint: activate
+              ? "Activating did not bring it onto the captured monitor. Move it there with " +
+                "gdr_window_control action=move, or capture the whole desktop."
+              : "Retry with activate=true.",
+          },
+          true
+        );
+      }
+
+      const shot = await captureResult(host, dev, {
+        profile: profileForLayout(undefined, profile),
+        // Settling matters more here than for a plain screenshot: we may have
+        // just triggered a raise/workspace animation ourselves.
+        settle: settle || ready.activated,
+        region: ready.window.stream_region,
+      });
+      return {
+        ...shot,
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              window: windowSummary(ready.window),
+              source: picked.source,
+              activated: ready.activated,
+            }),
+          },
+          ...shot.content,
+        ],
+      };
+    } catch (e) {
+      return windowError(e, windows);
+    }
+  }
+);
+
+server.tool(
+  "gdr_window_act",
+  "Activate a specific window, run a sequence of input steps, and return a " +
+    "screenshot of that window — the window-scoped counterpart to gdr_act, in " +
+    "one round trip. Activating first is the point: it guarantees the keystrokes " +
+    "and clicks land in the window you named rather than whatever happened to " +
+    "have focus. move/click x,y are in the image space of the most recent " +
+    "screenshot for this device (usually the previous gdr_window_screenshot).",
+  {
+    ...deviceArgs,
+    ...windowSelectorArgs,
+    steps: z.array(inputStep).min(1).describe("Ordered actions to run in the window"),
+    activate: z
+      .boolean()
+      .default(true)
+      .describe("Raise the window before running the steps (default true)."),
+    screenshot: z
+      .boolean()
+      .default(true)
+      .describe("Capture the window afterwards (default true)."),
+    profile: profileProp,
+    settle: settleAfterActionProp,
+  },
+  async ({ host, dev, steps, activate, screenshot, profile, settle, ...selector }) => {
+    let windows: WindowInfo[] | undefined;
+    try {
+      const picked = await pickWindow(host, dev, selector);
+      windows = picked.windows;
+      const client = clientFor(host, dev);
+      const ready = await ensureOnScreen(client, picked.window, activate);
+
+      const outcome = await runSequenceDetailed(
+        client,
+        remapInputSteps(host, dev, steps)
+      );
+      const summary = {
+        ...outcome,
+        window: windowSummary(ready.window),
+        source: picked.source,
+        activated: ready.activated,
+      };
+      if (!screenshot || !ready.window.stream_region) {
+        return textResult(
+          ready.window.stream_region
+            ? summary
+            : { ...summary, note: `no window screenshot: ${ready.blocker}` },
+          !outcome.ok
+        );
+      }
+
+      // Re-read geometry: the steps may have moved or resized the window,
+      // and cropping to where it *was* would show the wrong pixels.
+      const after = await client.listWindows(true);
+      const fresh = after.windows.find((w) => w.id === ready.window.id) ?? ready.window;
+      const region = fresh.stream_region ?? ready.window.stream_region;
+
+      const shot = await captureResult(host, dev, {
+        profile: profileForLayout(undefined, profile),
+        settle,
+        region,
+      });
+      return {
+        ...shot,
+        content: [
+          { type: "text" as const, text: JSON.stringify(summary) },
+          ...shot.content,
+        ],
+        isError: !outcome.ok,
+      };
+    } catch (e) {
+      return windowError(e, windows);
+    }
+  }
+);
+
+server.tool(
+  "gdr_window_events",
+  "Poll for windows opening, closing, gaining focus, or being (un)minimized. " +
+    "Pass the previous call's next_seq as since= to continue without gaps; " +
+    "start from the seq in gdr_windows. With wait_ms > 0 the call blocks until " +
+    "something happens, so watching costs one call rather than a spin loop.",
+  {
+    ...deviceArgs,
+    since: z
+      .number()
+      .int()
+      .default(0)
+      .describe("Resume after this sequence number. 0 returns the whole buffer."),
+    limit: z.number().int().min(1).max(512).default(100),
+    wait_ms: z
+      .number()
+      .int()
+      .min(0)
+      .max(30000)
+      .default(0)
+      .describe(
+        "Block up to this many ms for the first event. 0 returns immediately. " +
+          "Note this occupies the connection to this device for the duration."
+      ),
+    log: z
+      .boolean()
+      .default(true)
+      .describe("Append the events to the local window log (default true)."),
+  },
+  async ({ host, dev, since, limit, wait_ms, log }) => {
+    try {
+      const client = clientFor(host, dev);
+      const resp = await client.windowEvents(since, limit, wait_ms);
+      let deviceId: string | null = null;
+      try {
+        deviceId = deviceIdFor(dev || host);
+      } catch {
+        /* env device */
+      }
+      if (log && resp.events.length) {
+        appendWindowLog(
+          resp.events.map((e) => ({
+            ts: e.at,
+            device: deviceId,
+            kind: "window_event" as const,
+            event: e.kind,
+            seq: e.seq,
+            id: e.id,
+            app_id: e.app_id,
+            wm_class: e.wm_class,
+            title: e.title,
+          }))
+        );
+      }
+      return textResult({
+        count: resp.events.length,
+        next_seq: resp.next_seq,
+        dropped: resp.dropped,
+        reset: resp.reset,
+        events: resp.events,
+        note: resp.reset
+          ? "The compositor or the extension restarted, so sequence numbers began again — " +
+            "everything still buffered is above, but events from before the restart are gone."
+          : resp.dropped
+            ? "Polled too late: older events aged out of the ring buffer. Poll more often " +
+              "or use wait_ms to block."
+            : "Pass next_seq back as since= on the next call.",
+      });
+    } catch (e) {
+      return mapError(e);
+    }
+  }
+);
+
+server.tool(
+  "gdr_window_pin",
+  "Pin a window as the default target for every gdr_window_* tool on this " +
+    "device, so you stop repeating the same selector (and stop risking a typo " +
+    "acting on the wrong window). The pin is stored per device in " +
+    "~/.config/gdr/config.json, survives restarts, and records both the window " +
+    "id and its app/title — so it keeps working after the app is restarted. " +
+    "Call with no selector to show the current pin, or clear=true to wipe it. " +
+    "An explicit selector on any tool always overrides the pin.",
+  {
+    ...deviceArgs,
+    ...windowSelectorArgs,
+    clear: z.boolean().default(false).describe("Wipe the pin for this device."),
+    label: z.string().optional().describe("Friendly name for logs and output."),
+    note: z.string().optional().describe("Why this window is pinned."),
+  },
+  async ({ host, dev, clear, label, note, ...selector }) => {
+    try {
+      const deviceId = deviceIdFor(dev || host);
+
+      if (clear) {
+        const { path, previous } = clearPin(deviceId);
+        return textResult({
+          ok: true,
+          device: deviceId,
+          pinned_window: null,
+          previous,
+          config: path,
+          log: windowLogPath(),
+        });
+      }
+
+      const explicit = targetFromArgs(selector);
+      const existing = getPin(deviceId);
+
+      // No selector: report, don't guess. Pinning "whatever is focused right
+      // now" from a bare call would be a surprising side effect of asking
+      // what the pin is.
+      if (isEmptyTarget(explicit)) {
+        if (!existing) {
+          return textResult({
+            ok: true,
+            device: deviceId,
+            pinned_window: null,
+            note:
+              "No window pinned for this device. Pin one by passing id=, app_id= or title=.",
+            log: windowLogPath(),
+          });
+        }
+        let resolved: unknown = null;
+        let error: string | null = null;
+        try {
+          const client = clientFor(host, dev);
+          const list = await client.listWindows(true);
+          const hit = resolvePin(pinToTarget(existing) as WindowTarget, list.windows);
+          resolved = { ...windowSummary(hit.window), matched: hit.matched };
+        } catch (e) {
+          error = e instanceof Error ? e.message : String(e);
+        }
+        return textResult({
+          ok: error == null,
+          device: deviceId,
+          pinned_window: existing,
+          resolves_to: resolved,
+          error,
+          config: configPath(),
+          log: windowLogPath(),
+        });
+      }
+
+      // Resolve before storing: a pin that does not currently name exactly one
+      // window is a bug the user wants to hear about now, not on the next
+      // action against the wrong window.
+      const client = clientFor(host, dev);
+      const list = await client.listWindows(true);
+      const window = resolveWindow(explicit, list.windows);
+
+      const pin: PinnedWindow = {
+        ...cleanTarget({
+          id: window.id,
+          // Store the durable identity alongside the id, so the pin outlives
+          // the window: ids are recycled the moment the app restarts.
+          app_id: explicit.app_id ?? window.app_id ?? undefined,
+          wm_class: explicit.app_id ? undefined : (explicit.wm_class ?? window.wm_class ?? undefined),
+          title: explicit.title ?? undefined,
+        }),
+        label: label ?? window.title ?? window.app_id ?? null,
+        note: note ?? null,
+        pinned_at: new Date().toISOString(),
+        pinned_to: {
+          id: window.id,
+          title: window.title,
+          app_id: window.app_id,
+          wm_class: window.wm_class,
+        },
+      };
+      const stored = setPin(deviceId, pin);
+      return textResult({
+        ok: true,
+        device: deviceId,
+        pinned_window: stored.pin,
+        resolves_to: windowSummary(window),
+        config: stored.path,
+        log: windowLogPath(),
+        note:
+          "Every gdr_window_* tool now defaults to this window. Pass a selector to " +
+          "override once, or gdr_window_pin({clear:true}) to wipe it.",
+      });
+    } catch (e) {
+      return windowError(e);
+    }
+  }
+);
+
+server.tool(
+  "gdr_window_log",
+  "Read the local window log: pin changes, window actions you performed, and " +
+    "window open/close events recorded by gdr_window_events. Answers 'what was " +
+    "open at 14:30' and 'what was I pointed at' after the windows are gone.",
+  {
+    ...deviceArgs,
+    tail: z.number().int().min(1).max(1000).default(50).describe("Most recent N entries."),
+    kind: z
+      .enum(["pin_set", "pin_cleared", "window_event", "window_action"])
+      .optional()
+      .describe("Only entries of this kind."),
+    since: z.string().optional().describe("ISO-8601 timestamp; only entries at or after it."),
+    all_devices: z
+      .boolean()
+      .default(false)
+      .describe("Include other devices' entries (default: just this device)."),
+  },
+  async ({ host, dev, tail, kind, since, all_devices }) => {
+    try {
+      let device: string | null = null;
+      if (!all_devices) {
+        try {
+          device = deviceIdFor(dev || host);
+        } catch {
+          /* env device: fall back to everything */
+        }
+      }
+      const result = readWindowLog({ tail, kind, since, device });
+      return textResult({
+        path: result.path,
+        device,
+        matched: result.total,
+        returned: result.entries.length,
+        entries: result.entries,
+      });
+    } catch (e) {
+      return mapError(e);
+    }
+  }
+);
+
+server.tool(
+  "gdr_app_launch",
+  "Start an installed app, or raise it if it is already running — the way to " +
+    "reach a window that is not currently open at all. Pass list=true with a " +
+    "filter to discover app ids first. On GNOME an app id is its desktop-file " +
+    'id, e.g. "org.gnome.Nautilus" or "firefox".',
+  {
+    ...deviceArgs,
+    app_id: z.string().optional().describe("Desktop-file id to launch or raise."),
+    list: z
+      .boolean()
+      .default(false)
+      .describe("List installed apps matching `filter` instead of launching."),
+    filter: z.string().optional().describe("Substring of app id or name, for list=true."),
+  },
+  async ({ host, dev, app_id, list, filter }) => {
+    try {
+      const client = clientFor(host, dev);
+      if (list || !app_id) {
+        const apps = await client.listApps(filter ?? null);
+        return textResult({
+          count: apps.length,
+          filter: filter ?? null,
+          apps: apps.slice(0, 200),
+          note: app_id
+            ? undefined
+            : "Pass app_id= to launch one. Running apps are raised rather than started twice.",
+        });
+      }
+      const resp = await client.launchApp(app_id);
+      return textResult({
+        ok: true,
+        app_id: resp.app_id,
+        name: resp.name,
+        was_running: resp.was_running,
+        action: resp.was_running ? "activated existing window" : "launched",
+        note: resp.was_running
+          ? "An existing window was raised; it is now on screen."
+          : "The app was started. Give it a moment, then gdr_windows to find its window " +
+            "(or gdr_window_events with wait_ms to be told when it appears).",
+      });
+    } catch (e) {
+      return mapError(e);
+    }
+  }
+);
+
+const bufferArg = (fallback: number) =>
+  z
+    .number()
+    .int()
+    .min(0)
+    .max(60000)
+    .default(fallback)
+    .describe(
+      "Buffer time in ms: how long the watched thing must hold still before the " +
+        "event is sent. The report then describes the whole burst, and the state " +
+        "in it has been stable for this long — which is what makes it safe to act on."
+    );
+
+const maxBurstArg = z
+  .number()
+  .int()
+  .min(0)
+  .default(5000)
+  .describe(
+    "Send a still-moving burst anyway after this long, flagged settled:false. " +
+      "0 waits forever for quiet (a video would then never report)."
+  );
+
+/** Shape both creation tools return, so the two read the same. */
+function hookResult(
+  hook: ReturnType<typeof hookSummary>,
+  created: boolean,
+  extra: Record<string, unknown> = {}
+) {
+  return textResult({
+    ok: true,
+    action: created ? "created" : "updated",
+    hook,
+    ...extra,
+    note:
+      "Drain it with gdr_hook_events (pass wait_ms to block until something happens). " +
+      "Toggle it with gdr_hooks({action:'disable'|'enable', id}).",
+  });
+}
+
+server.tool(
+  "gdr_hook_screen",
+  "Subscribe to screen activity: gdrd watches the capture stream on its own " +
+    "and reports a circle covering whatever moved, once it has held still for " +
+    "buffer_ms. Point it at the whole screen, a fixed rectangle, or one window " +
+    "(which it then follows as the window moves). This is the tool for 'tell me " +
+    "when something happens' instead of screenshotting in a loop. Note the cost: " +
+    "while an activity hook is enabled gdrd keeps the desktop capture running, " +
+    "which is visible to anyone at the machine. Needs the screenshot scope. " +
+    "Pass id= to reconfigure an existing hook instead of creating a second one. " +
+    "IF IT REPORTS NOTHING, check the thing you are watching is actually being " +
+    "drawn before you touch threshold/grid: this hook sees the composited screen, " +
+    "so a background browser tab, an occluded window or a minimized one produces " +
+    "no activity at any sensitivity, because it genuinely is not repainting.",
+  {
+    ...deviceArgs,
+    id: z
+      .string()
+      .optional()
+      .describe("Existing hook id to reconfigure in place, from gdr_hooks."),
+    label: z.string().optional().describe("Friendly name, echoed on every event."),
+    enabled: z.boolean().default(true).describe("Create/leave it switched on."),
+    window_id: z
+      .number()
+      .int()
+      .optional()
+      .describe("Watch only this window id (the hook's own id is the `id` argument)."),
+    app_id: z.string().optional().describe("Watch only this window, by desktop-file id."),
+    wm_class: z.string().optional().describe("Watch only the window whose WM_CLASS contains this."),
+    title: z.string().optional().describe("Watch only the window whose title contains this."),
+    pid: z.number().int().optional().describe("Watch only the window owned by this process."),
+    focused: z.boolean().optional().describe("Watch whatever currently has keyboard focus."),
+    region: z
+      .object({
+        x: z.number().int().min(0),
+        y: z.number().int().min(0),
+        width: z.number().int().min(1),
+        height: z.number().int().min(1),
+      })
+      .optional()
+      .describe(
+        "Watch only this rectangle of capture-stream pixels (the space gdr_click " +
+          "uses, not image space). Ignored when a window selector is given."
+      ),
+    buffer_ms: bufferArg(400),
+    min_interval_ms: z
+      .number()
+      .int()
+      .min(0)
+      .default(0)
+      .describe(
+        "Never report more often than this. 0 (default) is off. Reach for it when " +
+          "what you are watching repaints on a timer — a clock, a spinner, a blinking " +
+          "panel — where buffer_ms cannot help because every repaint is its own " +
+          "settled burst and you get two identical events a second. It coalesces " +
+          "rather than drops: the event that comes out covers everything since the last."
+      ),
+    max_burst_ms: maxBurstArg,
+    poll_ms: z
+      .number()
+      .int()
+      .min(30)
+      .max(10000)
+      .default(120)
+      .describe("Sampling cadence. Bounds how quickly a change is noticed."),
+    threshold: z
+      .number()
+      .int()
+      .min(1)
+      .max(255)
+      .default(12)
+      .describe(
+        "Per-cell brightness delta that counts as change. Below ~8 the compositor's " +
+          "own noise reads as motion."
+      ),
+    min_cells: z
+      .number()
+      .int()
+      .min(1)
+      .default(1)
+      .describe("Cells that must change for a sample to count. Raise to ignore a caret."),
+    grid: z
+      .number()
+      .int()
+      .min(8)
+      .max(256)
+      .default(64)
+      .describe(
+        "Diff resolution along the long edge. Higher = finer circles and a smaller area " +
+          "averaged per cell, so small changes survive the averaging. Raise this (128-256) " +
+          "with `threshold` lowered (2-4) when what you are watching is text."
+      ),
+    max_radius: z
+      .number()
+      .int()
+      .min(0)
+      .default(0)
+      .describe(
+        "Drop bursts whose circle is larger than this radius in stream pixels — " +
+          "a way to ignore workspace switches and video. 0 keeps everything."
+      ),
+  },
+  async ({
+    host,
+    dev,
+    id,
+    label,
+    enabled,
+    region,
+    buffer_ms,
+    max_burst_ms,
+    poll_ms,
+    threshold,
+    min_cells,
+    grid,
+    max_radius,
+    min_interval_ms,
+    window_id,
+    app_id,
+    wm_class,
+    title,
+    pid,
+    focused,
+  }) => {
+    try {
+      const client = clientFor(host, dev);
+      const target = targetFromArgs({ id: window_id, app_id, wm_class, title, pid, focused });
+      const spec = activitySpec({
+        target: isEmptyTarget(target) ? null : target,
+        region: region ?? null,
+        buffer_ms,
+        min_interval_ms,
+        max_burst_ms,
+        poll_ms,
+        threshold,
+        min_cells,
+        grid,
+        max_radius,
+      });
+      const hook = id
+        ? await client.hookUpdate(id, { enabled, label, spec })
+        : await client.hookCreate(spec, label, enabled);
+      return hookResult(hookSummary(hook), !id, {
+        coordinates:
+          "Circles come back in capture-stream pixels, and also in your last " +
+          "screenshot's image space when one exists — those are the ones gdr_click takes.",
+      });
+    } catch (e) {
+      return mapError(e);
+    }
+  }
+);
+
+server.tool(
+  "gdr_hook_window",
+  "Subscribe to window lifecycle: opens, closes, resizes, moves, retitles. " +
+    "Each event carries the window's title and size, the owning process (pid, " +
+    "user, executable, command line) and what the geometry was before. " +
+    "Geometry changes are buffered, so a drag-resize reports once at its final " +
+    "size rather than a hundred times on the way there; closes are reported " +
+    "immediately, since there is nothing left to settle. Filter to one app with " +
+    "app_id/title, or leave it open to watch the whole desktop. Needs the window " +
+    "scope. Pass id= to reconfigure an existing hook in place.",
+  {
+    ...deviceArgs,
+    id: z
+      .string()
+      .optional()
+      .describe("Existing hook id to reconfigure in place, from gdr_hooks."),
+    label: z.string().optional().describe("Friendly name, echoed on every event."),
+    enabled: z.boolean().default(true).describe("Create/leave it switched on."),
+    events: z
+      .array(z.enum(WINDOW_HOOK_EVENTS))
+      .min(1)
+      .default(["opened", "closed", "resized"])
+      .describe("Which lifecycle events to report."),
+    window_id: z
+      .number()
+      .int()
+      .optional()
+      .describe("Watch only this window id (the hook's own id is the `id` argument)."),
+    app_id: z.string().optional().describe('Watch only this desktop-file id, e.g. "chromium".'),
+    wm_class: z.string().optional().describe("Watch only windows whose WM_CLASS contains this."),
+    title: z.string().optional().describe("Watch only windows whose title contains this."),
+    pid: z.number().int().optional().describe("Watch only windows owned by this process."),
+    buffer_ms: bufferArg(250),
+    max_burst_ms: maxBurstArg,
+    poll_ms: z
+      .number()
+      .int()
+      .min(50)
+      .max(10000)
+      .default(250)
+      .describe(
+        "How often the window list is re-read. Bounds how quickly an open or a " +
+          "resize is noticed."
+      ),
+    include_skip_taskbar: z
+      .boolean()
+      .default(false)
+      .describe("Include docks, panels and notification popups, which are normally noise."),
+    include_process: z
+      .boolean()
+      .default(true)
+      .describe("Look up the owning process in /proc for each event."),
+    geometry_threshold: z
+      .number()
+      .int()
+      .min(0)
+      .default(2)
+      .describe("Ignore moves/resizes smaller than this many logical pixels."),
+  },
+  async ({
+    host,
+    dev,
+    id,
+    label,
+    enabled,
+    events,
+    window_id,
+    app_id,
+    wm_class,
+    title,
+    pid,
+    buffer_ms,
+    max_burst_ms,
+    poll_ms,
+    include_skip_taskbar,
+    include_process,
+    geometry_threshold,
+  }) => {
+    try {
+      const client = clientFor(host, dev);
+      const target = targetFromArgs({ id: window_id, app_id, wm_class, title, pid });
+      const spec = windowSpec({
+        target: isEmptyTarget(target) ? null : target,
+        events,
+        buffer_ms,
+        max_burst_ms,
+        poll_ms,
+        include_skip_taskbar,
+        include_process,
+        geometry_threshold,
+      });
+      const hook = id
+        ? await client.hookUpdate(id, { enabled, label, spec })
+        : await client.hookCreate(spec, label, enabled);
+      return hookResult(hookSummary(hook), !id);
+    } catch (e) {
+      return mapError(e);
+    }
+  }
+);
+
+server.tool(
+  "gdr_hooks",
+  "List the subscriptions on a device, and switch them on or off. Disabling " +
+    "keeps the hook, its configuration and its buffered events, so 'watch while " +
+    "I do this, then stop' costs one call each way. Each hook reports the scope " +
+    "it needs and the scopes the token that created it held — a hook you can see " +
+    "here is one this token is allowed to read and change.",
+  {
+    ...deviceArgs,
+    action: z
+      .enum(["list", "enable", "disable", "remove"])
+      .default("list")
+      .describe("What to do. Everything but list needs id=."),
+    id: z.string().optional().describe("Hook id, for enable/disable/remove."),
+  },
+  async ({ host, dev, action, id }) => {
+    try {
+      const client = clientFor(host, dev);
+      if (action === "list") {
+        const hooks = await client.hookList();
+        return textResult({
+          count: hooks.length,
+          hooks: hooks.map(hookSummary),
+          note: hooks.length
+            ? "Drain events with gdr_hook_events."
+            : "No hooks yet — create one with gdr_hook_screen or gdr_hook_window.",
+        });
+      }
+      if (!id) {
+        return textResult(
+          { error: `${action} needs id= — call gdr_hooks({action:"list"}) to see them.` },
+          true
+        );
+      }
+      const hook =
+        action === "remove"
+          ? await client.hookRemove(id)
+          : await client.hookUpdate(id, { enabled: action === "enable" });
+      return textResult({
+        ok: true,
+        action,
+        hook: hookSummary(hook),
+        note:
+          action === "remove"
+            ? "Gone, along with any events of its that were still buffered."
+            : action === "disable"
+              ? "Switched off. Its config and buffered events are kept; enable it to resume."
+              : "Switched on. It starts reporting on its next sample.",
+      });
+    } catch (e) {
+      return mapError(e);
+    }
+  }
+);
+
+server.tool(
+  "gdr_hook_events",
+  "Drain what the subscriptions have seen. Sequence numbers are shared across " +
+    "hooks, so one call collects every subscription at once — pass the previous " +
+    "reply's next_seq as since= to continue without gaps or repeats. With " +
+    "wait_ms > 0 the call blocks until something lands, which is how to wait for " +
+    "an app to finish opening without a screenshot loop. Activity events carry a " +
+    "circle in both stream and screenshot-image coordinates; window events carry " +
+    "title, size and owning process.",
+  {
+    ...deviceArgs,
+    id: z
+      .string()
+      .optional()
+      .describe(
+        "Only this hook. Omit to drain every hook at once — which is the simpler " +
+          "loop, because sequence numbers are global: a next_seq from a filtered " +
+          "drain is a cursor for THAT filter only."
+      ),
+    since: z
+      .number()
+      .int()
+      .min(0)
+      .default(0)
+      .describe(
+        "Exclusive cursor: returns events with seq > since. Pass back the previous " +
+          "reply's next_seq verbatim — do NOT add one to it. 0 returns everything buffered."
+      ),
+    limit: z.number().int().min(1).max(512).default(100),
+    wait_ms: z
+      .number()
+      .int()
+      .min(0)
+      .max(120000)
+      .default(0)
+      .describe(
+        "Block up to this many ms for the first event. 0 returns immediately. " +
+          "Note this occupies the connection to this device for the duration."
+      ),
+  },
+  async ({ host, dev, id, since, limit, wait_ms }) => {
+    try {
+      const client = clientFor(host, dev);
+      const result = await client.hookPoll(id ?? null, since, limit, wait_ms);
+      // Activity circles are only clickable against a screenshot this device
+      // has actually produced; without one they stay in stream coordinates.
+      const frame = frames.get(deviceKey(host, dev));
+      return textResult({
+        count: result.events.length,
+        // Named for how it is used, not for what it counts: it is the last
+        // seq handed over, and `since` is exclusive, so passing it straight
+        // back is correct and adding one to it silently drops an event.
+        next_seq: result.next_seq,
+        cursor_scope: result.cursor_scope ?? "all",
+        ...(result.skipped_other_hooks
+          ? { skipped_other_hooks: result.skipped_other_hooks }
+          : {}),
+        dropped: result.dropped,
+        events: result.events.map((e) => hookEventSummary(e, frame)),
+        hooks: result.hooks.map(hookSummary),
+        note: pollNote(result),
+      });
+    } catch (e) {
+      return mapError(e);
     }
   }
 );

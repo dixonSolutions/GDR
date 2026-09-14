@@ -11,6 +11,10 @@ The root [`README.md`](../README.md) is the quick-start; everything here goes de
 | [CONFIG.md](./CONFIG.md) | `~/.config/gdr/config.json`, tokens.json, env vars |
 | [TOKENS.md](./TOKENS.md) | Multi-token lifecycle, scopes, expiry, revocation |
 | [MCP.md](./MCP.md) | MCP tools, password tool tradeoff, host resolution |
+| [WINDOWS.md](./WINDOWS.md) | Window plane: listing, acting on one window, events, pinning — and the shell extension it needs |
+| [HOOKS.md](./HOOKS.md) | Subscription hooks: standing watches on screen activity (as a circle) and window lifecycle, buffer time, scopes |
+| [PERFORMANCE.md](./PERFORMANCE.md) | What actually costs time in an agent loop, sizing/token budget, settle, zoom, batching — and what we chose not to build |
+| [BENCHMARKS.md](./BENCHMARKS.md) | Task-level computer-use benchmarks — what an agent actually gets done, and why aim is the ceiling |
 | [DEPLOYMENT.md](./DEPLOYMENT.md) | `deploy.sh`, system `.deb`/`.rpm`, MCP Cursor setup, systemd |
 | [TESTING.md](./TESTING.md) | Unit tests, how we E2E against a real GNOME host |
 | [PROGRESS.md](./PROGRESS.md) | What is built, what is next, open decisions |
